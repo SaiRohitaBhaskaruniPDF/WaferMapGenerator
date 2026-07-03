@@ -1,4 +1,6 @@
 """
+Exensio ready binary file(STDF strict binary format. This file builds it byte-by-byte. The helpers at the top do the low-level encoding)
+
 Minimal STDF (Standard Test Data Format) writer.
 
 Produces a valid STDF v4 binary file containing:
@@ -29,7 +31,16 @@ from signatures import BIN_DEFINITIONS, DieResult
 # ---------------------------------------------------------------------------
 # Low-level record helpers
 # ---------------------------------------------------------------------------
+"""
+_u1/_u2/_u4 = pack a numbers into 1,2 or 4bytes(STDF requires exact byte size)
 
+_cn = pack of string with a legth prefix
+
+_record = wrap any record with its header
+
+
+
+"""
 def _u1(v: int) -> bytes:
     return struct.pack("<B", v & 0xFF)
 
