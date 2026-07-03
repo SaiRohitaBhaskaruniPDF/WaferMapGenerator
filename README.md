@@ -66,6 +66,48 @@ py -m streamlit run app.py
 
 Open the URL shown in the terminal (usually `http://localhost:8501`).
 
+## Deploy for Steve (Streamlit Community Cloud)
+
+The easiest way to share a live link is [Streamlit Community Cloud](https://share.streamlit.io) (free).
+
+### 1. Deploy the app
+
+1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with **GitHub** (`SaiRohitaBhaskaruni01`).
+2. Click **Create app**.
+3. Select repository: `SaiRohitaBhaskaruni01/WaferMapGenerator`
+4. Branch: `main`
+5. Main file: `app.py`
+6. Click **Deploy**.
+
+If the repo is **private**, grant Streamlit access first:
+- Streamlit Cloud → your username → **Settings** → **Linked accounts** → connect private repo access.
+
+### 2. Add Azure secrets (for AI Chat tab)
+
+In the deployed app → **Settings** → **Secrets**, paste:
+
+```toml
+AZURE_OPENAI_API_KEY = "your-key"
+AZURE_OPENAI_ENDPOINT = "https://your-resource.openai.azure.com/"
+AZURE_OPENAI_DEPLOYMENT = "your-deployment-name"
+AZURE_OPENAI_API_VERSION = "2024-12-01-preview"
+```
+
+Click **Save**. The app will reboot with AI chat enabled. Manual tab works without secrets.
+
+### 3. Share with Steve
+
+| Option | How |
+|--------|-----|
+| **Private app + invite** | App settings → **Sharing** → add Steve's email as **Viewer** (best if repo stays private) |
+| **Public app link** | App settings → set visibility to **Public** → send URL `https://your-app.streamlit.app` |
+
+Private GitHub repo → app is private by default. Steve needs an invite unless you make the app public.
+
+### 4. After you push code updates
+
+Streamlit redeploys automatically when you `git push` to `main`.
+
 ## Usage
 
 ### Manual tab

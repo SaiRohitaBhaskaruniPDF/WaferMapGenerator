@@ -20,6 +20,27 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+
+def _inject_streamlit_secrets() -> None:
+    """Load Streamlit Cloud secrets into os.environ for llm_agent."""
+    try:
+        for key in (
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_ENDPOINT",
+            "AZURE_OPENAI_DEPLOYMENT",
+            "AZURE_OPENAI_API_VERSION",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+        ):
+            value = st.secrets.get(key)
+            if value and not os.environ.get(key):
+                os.environ[key] = str(value)
+    except Exception:
+        pass
+
+
+_inject_streamlit_secrets()
+
 from geometry import WaferConfig, compute_die_grid
 from renderer import render_wafermaps
 from signatures import SIGNATURE_NAMES, BIN_DEFINITIONS, apply_signature
