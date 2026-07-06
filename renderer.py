@@ -14,10 +14,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.patches import Circle
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from geometry import WaferConfig
 from signatures import BIN_DEFINITIONS, DieResult
+
+IMAGE_FORMATS: Tuple[str, ...] = ("png", "svg", "jpeg", "tiff")
+IMAGE_MIMES = {
+    "png": "image/png",
+    "svg": "image/svg+xml",
+    "jpeg": "image/jpeg",
+    "tiff": "image/tiff",
+}
 
 # Dark theme colors
 BG_COLOR = "#1A1A2E"       # page background
@@ -105,6 +113,23 @@ def _draw_single_wafer(ax, dies_with_bins: List[DieResult], config: WaferConfig,
         )
 
     return yld
+
+
+def figure_to_bytes(fig: plt.Figure, fmt: str = "png", dpi: int = 150) -> bytes:
+    """Serialize a matplotlib figure to bytes in the given image format."""
+    fmt = fmt.lower()
+    if fmt not in IMAGE_FORMATS:
+        raise ValueError(f"Unsupported format: {fmt}. Choose from {IMAGE_FORMATS}")
+
+    buf = io.BytesIO()
+    save_kwargs = {"format": fmt, "bbox_inches": "tight", "facecolor": fig.get_facecolor()}
+    if fmt != "svg":
+        save_kwargs["dpi"] = dpi
+    if fmt == "jpeg":
+        save_kwargs["pil_kwargs"] = {"quality": 92}
+    fig.savefig(buf, **save_kwargs)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def render_single_wafer_svg(dies_with_bins: List[DieResult], config: WaferConfig,

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from geometry import WaferConfig
 from signatures import SIGNATURE_NAMES
 
 
@@ -59,6 +60,11 @@ class WaferGenRequest:
     die_height: float = 10.0         # mm
     x_offset: float = 0.0
     y_offset: float = 0.0
+    street_width: float = 0.0
+    dies_per_reticle_x: int = 2
+    dies_per_reticle_y: int = 2
+    reticle_fail_die_x: int = 0
+    reticle_fail_die_y: int = 0
 
     # Lot / generation
     lot_id: str = "LOT_001"
@@ -117,6 +123,26 @@ _FUNCTION_SCHEMA = {
                 "type": "number",
                 "description": "Vertical shift of the die grid from center (mm).",
             },
+            "street_width": {
+                "type": "number",
+                "description": "Scribe/street width between dies in mm (0–3 typical). Default 0.",
+            },
+            "dies_per_reticle_x": {
+                "type": "integer",
+                "description": "Number of dies across one reticle field in X (1–6). Default 2.",
+            },
+            "dies_per_reticle_y": {
+                "type": "integer",
+                "description": "Number of dies across one reticle field in Y (1–6). Default 2.",
+            },
+            "reticle_fail_die_x": {
+                "type": "integer",
+                "description": "0-based die column within reticle that fails (for Reticle Pattern).",
+            },
+            "reticle_fail_die_y": {
+                "type": "integer",
+                "description": "0-based die row within reticle that fails (for Reticle Pattern).",
+            },
             "lot_id": {
                 "type": "string",
                 "description": "Lot identifier string, e.g. 'LOT_A42'.",
@@ -163,6 +189,11 @@ WAFER DIAMETERS: 150 mm (6"), 200 mm (8"), 300 mm (12"). Default to 300 mm.
 
 DIE SIZES: typical range 5–20 mm. Default 10×10 mm.
 
+STREET WIDTH: scribe gap between dies, 0–3 mm typical. Default 0.
+
+RETICLE LAYOUT: dies_per_reticle_x/y (default 2×2). For Reticle Pattern signature,
+set reticle_fail_die_x/y to pick which die position fails in every reticle shot.
+
 NUM WAFERS: default 4, max 25.
 
 LOT / PROGRAM: invent plausible IDs if not specified (e.g. LOT_A01, PRD_HBN20).
@@ -196,10 +227,17 @@ def _parse_tool_args(response) -> dict:
     args["diameter"] = float(args.get("diameter", 300))
     args["die_width"] = float(args.get("die_width", 10))
     args["die_height"] = float(args.get("die_height", 10))
+    args["street_width"] = max(0.0, min(5.0, float(args.get("street_width", 0))))
+    args["dies_per_reticle_x"] = max(1, min(6, int(args.get("dies_per_reticle_x", 2))))
+    args["dies_per_reticle_y"] = max(1, min(6, int(args.get("dies_per_reticle_y", 2))))
+    args["reticle_fail_die_x"] = max(0, int(args.get("reticle_fail_die_x", 0)))
+    args["reticle_fail_die_y"] = max(0, int(args.get("reticle_fail_die_y", 0)))
     return args
 
 
 def _args_to_request(args: dict) -> WaferGenRequest:
+    dpr_x = max(1, min(6, int(args.get("dies_per_reticle_x", 2))))
+    dpr_y = max(1, min(6, int(args.get("dies_per_reticle_y", 2))))
     return WaferGenRequest(
         diameter=args.get("diameter", 300.0),
         edge_type=args.get("edge_type", "notch"),
@@ -208,12 +246,35 @@ def _args_to_request(args: dict) -> WaferGenRequest:
         die_height=args.get("die_height", 10.0),
         x_offset=args.get("x_offset", 0.0),
         y_offset=args.get("y_offset", 0.0),
+        street_width=max(0.0, min(5.0, float(args.get("street_width", 0.0)))),
+        dies_per_reticle_x=dpr_x,
+        dies_per_reticle_y=dpr_y,
+        reticle_fail_die_x=int(args.get("reticle_fail_die_x", 0)) % dpr_x,
+        reticle_fail_die_y=int(args.get("reticle_fail_die_y", 0)) % dpr_y,
         lot_id=args.get("lot_id", "LOT_001"),
         program=args.get("program", "DEMO"),
         num_wafers=args.get("num_wafers", 4),
         signature=args.get("signature", "Edge Ring"),
         explanation=args.get("explanation", ""),
         used_llm=True,
+    )
+
+
+def request_to_config(req: WaferGenRequest) -> WaferConfig:
+    """Build WaferConfig from a parsed generation request."""
+    return WaferConfig(
+        diameter=req.diameter,
+        edge_type=req.edge_type,
+        edge_exclusion=req.edge_exclusion,
+        die_width=req.die_width,
+        die_height=req.die_height,
+        x_offset=req.x_offset,
+        y_offset=req.y_offset,
+        street_width=req.street_width,
+        dies_per_reticle_x=req.dies_per_reticle_x,
+        dies_per_reticle_y=req.dies_per_reticle_y,
+        reticle_fail_die_x=req.reticle_fail_die_x,
+        reticle_fail_die_y=req.reticle_fail_die_y,
     )
 
 
@@ -325,17 +386,40 @@ def _keyword_parse(text: str) -> WaferGenRequest:
     if m:
         req.num_wafers = max(1, min(25, int(m.group(1))))
 
-    # Diameter
-    for d in [300, 200, 150]:
-        if str(d) in t:
-            req.diameter = float(d)
-            break
-
-    # Die size
+    # Die size (before generic mm parsing)
     m = re.search(r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*mm", t)
     if m:
         req.die_width  = float(m.group(1))
         req.die_height = float(m.group(2))
+
+    # Diameter — e.g. "200 mm wafer" or "100mm"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*mm\s*(?:wafer|diameter)", t)
+    if m:
+        req.diameter = float(m.group(1))
+    else:
+        for d in [300, 200, 150, 100]:
+            if re.search(rf"\b{d}\s*mm\b", t):
+                req.diameter = float(d)
+                break
+
+    # Street width — "0.2 mm street" or "street width 0.2 mm"
+    m = re.search(
+        r"(\d+(?:\.\d+)?)\s*mm\s*street|street(?:\s*width)?\s*(\d+(?:\.\d+)?)\s*mm",
+        t,
+    )
+    if m:
+        req.street_width = float(m.group(1) or m.group(2))
+    elif re.search(r"\bstreet\b|\bscribe\b", t):
+        req.street_width = 0.1
+
+    # Reticle layout — e.g. "3x3 reticle" or "2x2 dies per reticle"
+    m = re.search(
+        r"(\d+)\s*[x×]\s*(\d+)\s*(?:dies?\s*)?(?:per\s*)?reticle|reticle\s*(\d+)\s*[x×]\s*(\d+)",
+        t,
+    )
+    if m:
+        req.dies_per_reticle_x = max(1, min(6, int(m.group(1) or m.group(3))))
+        req.dies_per_reticle_y = max(1, min(6, int(m.group(2) or m.group(4))))
 
     # Lot ID
     m = re.search(r"lot[_\s-]?(\w+)", t, re.IGNORECASE)
@@ -346,6 +430,12 @@ def _keyword_parse(text: str) -> WaferGenRequest:
         f"[Keyword parser] Detected signature: **{req.signature}**, "
         f"{req.num_wafers} wafer(s), {int(req.diameter)} mm diameter."
     )
+    if req.street_width > 0:
+        req.explanation += f" Street width: {req.street_width} mm."
+    if req.signature == "Reticle Pattern":
+        req.explanation += (
+            f" Reticle layout: {req.dies_per_reticle_x}×{req.dies_per_reticle_y} dies/shot."
+        )
     req.used_llm = False
     return req
 

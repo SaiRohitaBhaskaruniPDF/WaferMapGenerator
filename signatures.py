@@ -264,19 +264,24 @@ def assign_hot_spot(dies, spot_x=None, spot_y=None, spot_r=None,
     return results
 
 
-def assign_reticle(dies, reticle_w=None, reticle_h=None,
-                   fail_rate=0.85, fail_col=0, fail_row=0, seed=None):
-    """Repeating reticle-field pattern — every reticle shot at (fail_col, fail_row)."""
+def assign_reticle(dies, dies_per_reticle_x=2, dies_per_reticle_y=2,
+                   fail_die_x=0, fail_die_y=0, fail_rate=0.85, seed=None):
+    """Repeating reticle-field pattern — same die position fails in every reticle shot."""
     rng = random.Random(seed)
-    rw = reticle_w or 26.0
-    rh = reticle_h or 33.0
+    dpr_x = max(1, int(dies_per_reticle_x))
+    dpr_y = max(1, int(dies_per_reticle_y))
+    fail_x = int(fail_die_x) % dpr_x
+    fail_y = int(fail_die_y) % dpr_y
     results = []
     for die in dies:
         dieX, dieY, cx, cy = die
-        # Which reticle field does this die fall in?
-        col_idx = int(np.floor(cx / rw)) % 2
-        row_idx = int(np.floor(cy / rh)) % 2
-        if (col_idx == fail_col % 2) and (row_idx == fail_row % 2) and rng.random() < fail_rate:
+        local_x = dieX % dpr_x
+        local_y = dieY % dpr_y
+        if local_x < 0:
+            local_x += dpr_x
+        if local_y < 0:
+            local_y += dpr_y
+        if local_x == fail_x and local_y == fail_y and rng.random() < fail_rate:
             results.append(_fail(die, 12))
         else:
             results.append(_pass(die))
@@ -618,11 +623,14 @@ def apply_signature(dies: List[Die], signature_type: str,
                                spot_y=r_val * np.sin(angle),
                                spot_r=radius * 0.14, seed=seed)
     elif s == "Reticle Pattern":
-        return assign_reticle(dies,
-                              reticle_w=config.die_width * 2,
-                              reticle_h=config.die_height * 2,
-                              fail_col=(seed or 0) % 2,
-                              fail_row=((seed or 0) // 2) % 2, seed=seed)
+        return assign_reticle(
+            dies,
+            dies_per_reticle_x=config.dies_per_reticle_x,
+            dies_per_reticle_y=config.dies_per_reticle_y,
+            fail_die_x=config.reticle_fail_die_x,
+            fail_die_y=config.reticle_fail_die_y,
+            seed=seed,
+        )
     elif s == "Low Yield":
         return assign_low_yield(dies, fail_fraction=0.55, seed=seed)
     elif s == "Corner Clusters":
