@@ -74,11 +74,19 @@ def _draw_single_wafer(ax, dies_with_bins: List[DieResult], config: WaferConfig,
         )
         ax.add_patch(rect)
 
-    # Notch: small triangle at the bottom of the wafer
+    # Notch: small wedge cut from the wafer edge at the requested orientation
     if config.edge_type == "notch":
         notch_size = radius * 0.035
+        _NOTCH_PARAMS = {
+            "down":  {"center": (0,       -radius), "theta1": 60,  "theta2": 120},
+            "up":    {"center": (0,        radius), "theta1": 240, "theta2": 300},
+            "left":  {"center": (-radius,  0),      "theta1": -30, "theta2": 30},
+            "right": {"center": ( radius,  0),      "theta1": 150, "theta2": 210},
+        }
+        p = _NOTCH_PARAMS.get(getattr(config, "notch_orientation", "down"),
+                               _NOTCH_PARAMS["down"])
         ax.add_patch(patches.Wedge(
-            (0, -radius), notch_size, 60, 120,
+            p["center"], notch_size, p["theta1"], p["theta2"],
             color=BG_COLOR, zorder=4
         ))
     # Flat: cut the bottom of the circle with a dark rectangle

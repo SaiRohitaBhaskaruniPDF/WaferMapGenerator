@@ -23,6 +23,7 @@ class WaferConfig:
     dies_per_reticle_y: int = 2  # dies across one reticle field (Y)
     reticle_fail_die_x: int = 0  # which die column inside the reticle fails (0-based)
     reticle_fail_die_y: int = 0  # which die row inside the reticle fails (0-based)
+    notch_orientation: str = "down"  # 'down' | 'up' | 'left' | 'right'
 
     @property
     def pitch_x(self) -> float:

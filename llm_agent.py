@@ -30,6 +30,12 @@ from typing import Optional
 from geometry import WaferConfig
 from signatures import SIGNATURE_NAMES
 
+MAX_WAFERS = 100
+
+
+def _clamp_wafers(n: int) -> int:
+    return max(1, min(MAX_WAFERS, int(n)))
+
 
 def _load_env_file() -> None:
     """Load variables from project-root `.env` if present."""
@@ -65,6 +71,9 @@ class WaferGenRequest:
     dies_per_reticle_y: int = 2
     reticle_fail_die_x: int = 0
     reticle_fail_die_y: int = 0
+
+    # Wafer orientation
+    notch_orientation: str = "down"  # 'down' | 'up' | 'left' | 'right'
 
     # Lot / generation
     lot_id: str = "LOT_001"
@@ -127,6 +136,16 @@ _FUNCTION_SCHEMA = {
                 "type": "number",
                 "description": "Scribe/street width between dies in mm (0–3 typical). Default 0.",
             },
+            "notch_orientation": {
+                "type": "string",
+                "enum": ["down", "up", "left", "right"],
+                "description": (
+                    "Which direction the notch points on the wafer map image. "
+                    "'down' = 6 o'clock (default/standard). "
+                    "'up' = 12 o'clock. 'left' = 9 o'clock. 'right' = 3 o'clock. "
+                    "Phrases like 'notch down' → down, 'notch up' → up."
+                ),
+            },
             "dies_per_reticle_x": {
                 "type": "integer",
                 "description": "Number of dies across one reticle field in X (1–6). Default 2.",
@@ -153,7 +172,7 @@ _FUNCTION_SCHEMA = {
             },
             "num_wafers": {
                 "type": "integer",
-                "description": "Number of wafers to generate (1–25).",
+                "description": f"Number of wafers to generate (1–{MAX_WAFERS}).",
             },
             "signature": {
                 "type": "string",
@@ -189,12 +208,22 @@ WAFER DIAMETERS: 150 mm (6"), 200 mm (8"), 300 mm (12"). Default to 300 mm.
 
 DIE SIZES: typical range 5–20 mm. Default 10×10 mm.
 
-STREET WIDTH: scribe gap between dies, 0–3 mm typical. Default 0.
+STREET WIDTH: scribe/street gap between dies. Always return street_width in mm.
+  - Users may say "50 um", "50 µm", or "50 micron" scribe → convert to mm (50 µm = 0.05 mm).
+  - Typical range 0–3 mm. Default 0.
+
+EDGE TYPE: 'notch' (default) or 'flat'. Phrases like "notch down" mean edge_type = notch.
+
+NOTCH ORIENTATION: where the notch points on the image.
+  - 'notch down' or just 'notch' → notch_orientation = 'down' (default, 6 o'clock)
+  - 'notch up'    → notch_orientation = 'up'
+  - 'notch left'  → notch_orientation = 'left'
+  - 'notch right' → notch_orientation = 'right'
 
 RETICLE LAYOUT: dies_per_reticle_x/y (default 2×2). For Reticle Pattern signature,
 set reticle_fail_die_x/y to pick which die position fails in every reticle shot.
 
-NUM WAFERS: default 4, max 25.
+NUM WAFERS: default 4, max {MAX_WAFERS}.
 
 LOT / PROGRAM: invent plausible IDs if not specified (e.g. LOT_A01, PRD_HBN20).
 
@@ -223,7 +252,7 @@ def _parse_tool_args(response) -> dict:
         raise RuntimeError("LLM did not return a tool call")
 
     args = json.loads(tool_calls[0].function.arguments)
-    args["num_wafers"] = max(1, min(25, int(args.get("num_wafers", 4))))
+    args["num_wafers"] = _clamp_wafers(args.get("num_wafers", 4))
     args["diameter"] = float(args.get("diameter", 300))
     args["die_width"] = float(args.get("die_width", 10))
     args["die_height"] = float(args.get("die_height", 10))
@@ -255,6 +284,7 @@ def _args_to_request(args: dict) -> WaferGenRequest:
         program=args.get("program", "DEMO"),
         num_wafers=args.get("num_wafers", 4),
         signature=args.get("signature", "Edge Ring"),
+        notch_orientation=args.get("notch_orientation", "down"),
         explanation=args.get("explanation", ""),
         used_llm=True,
     )
@@ -275,6 +305,7 @@ def request_to_config(req: WaferGenRequest) -> WaferConfig:
         dies_per_reticle_y=req.dies_per_reticle_y,
         reticle_fail_die_x=req.reticle_fail_die_x,
         reticle_fail_die_y=req.reticle_fail_die_y,
+        notch_orientation=req.notch_orientation,
     )
 
 
@@ -370,6 +401,69 @@ _KEYWORD_MAP = {
 }
 
 
+def _parse_die_size_mm(text: str) -> tuple[float, float] | None:
+    """Parse die size from phrases like '9 mm x 5 mm', '9x5 mm', or 'die size 9 x 5'."""
+    patterns = (
+        r"(\d+(?:\.\d+)?)\s*mm\s*[x×]\s*(\d+(?:\.\d+)?)\s*mm",
+        r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*mm",
+        r"die\s+size\s+(\d+(?:\.\d+)?)\s*(?:mm\s*)?[x×]\s*(\d+(?:\.\d+)?)\s*(?:mm)?",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return float(m.group(1)), float(m.group(2))
+    return None
+
+
+def _parse_street_width_mm(text: str) -> float | None:
+    """Parse scribe/street width; accepts mm, um, µm, or micron units."""
+    t = text.lower()
+    m = re.search(
+        r"(?:scribe|street)(?:\s*width)?\s*(?:of\s*)?(\d+(?:\.\d+)?)\s*(?:um|µm|microns?)"
+        r"|(\d+(?:\.\d+)?)\s*(?:um|µm|microns?)\s*(?:scribe|street|width)",
+        t,
+    )
+    if m:
+        return float(m.group(1) or m.group(2)) / 1000.0
+
+    m = re.search(
+        r"(\d+(?:\.\d+)?)\s*mm\s*(?:scribe|street)"
+        r"|(?:scribe|street)(?:\s*width)?\s*(?:of\s*)?(\d+(?:\.\d+)?)\s*mm",
+        t,
+    )
+    if m:
+        return float(m.group(1) or m.group(2))
+    return None
+
+
+def _parse_edge_type(text: str) -> str | None:
+    t = text.lower()
+    if re.search(r"\bflat\b", t):
+        return "flat"
+    if re.search(r"\bnotch\b", t):
+        return "notch"
+    return None
+
+
+def _parse_notch_orientation(text: str) -> str:
+    t = text.lower()
+    if re.search(r"notch\s*up|notch\s*top|notch\s*12", t):
+        return "up"
+    if re.search(r"notch\s*left|notch\s*9", t):
+        return "left"
+    if re.search(r"notch\s*right|notch\s*3", t):
+        return "right"
+    return "down"
+
+
+def _format_street_width(street_width: float) -> str:
+    if street_width <= 0:
+        return ""
+    if street_width < 0.1:
+        return f" Street width: {street_width * 1000:.0f} µm ({street_width} mm)."
+    return f" Street width: {street_width} mm."
+
+
 def _keyword_parse(text: str) -> WaferGenRequest:
     """Best-effort keyword extraction without an LLM."""
     t = text.lower()
@@ -381,16 +475,14 @@ def _keyword_parse(text: str) -> WaferGenRequest:
             req.signature = sig
             break
 
-    # Number of wafers
-    m = re.search(r"(\d+)\s*(wafer|map)", t)
+    # Number of wafers — "100 wafers", "generate 100 wafer maps"
+    m = re.search(r"(\d+)\s*(?:wafer|map)", t)
     if m:
-        req.num_wafers = max(1, min(25, int(m.group(1))))
+        req.num_wafers = _clamp_wafers(int(m.group(1)))
 
-    # Die size (before generic mm parsing)
-    m = re.search(r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*mm", t)
-    if m:
-        req.die_width  = float(m.group(1))
-        req.die_height = float(m.group(2))
+    die_size = _parse_die_size_mm(text)
+    if die_size:
+        req.die_width, req.die_height = die_size
 
     # Diameter — e.g. "200 mm wafer" or "100mm"
     m = re.search(r"(\d+(?:\.\d+)?)\s*mm\s*(?:wafer|diameter)", t)
@@ -402,13 +494,15 @@ def _keyword_parse(text: str) -> WaferGenRequest:
                 req.diameter = float(d)
                 break
 
-    # Street width — "0.2 mm street" or "street width 0.2 mm"
-    m = re.search(
-        r"(\d+(?:\.\d+)?)\s*mm\s*street|street(?:\s*width)?\s*(\d+(?:\.\d+)?)\s*mm",
-        t,
-    )
-    if m:
-        req.street_width = float(m.group(1) or m.group(2))
+    edge_type = _parse_edge_type(text)
+    if edge_type:
+        req.edge_type = edge_type
+
+    req.notch_orientation = _parse_notch_orientation(text)
+
+    street_width = _parse_street_width_mm(text)
+    if street_width is not None:
+        req.street_width = max(0.0, min(5.0, street_width))
     elif re.search(r"\bstreet\b|\bscribe\b", t):
         req.street_width = 0.1
 
@@ -426,12 +520,16 @@ def _keyword_parse(text: str) -> WaferGenRequest:
     if m:
         req.lot_id = f"LOT_{m.group(1).upper()}"
 
+    edge_str = (
+        f"notch {req.notch_orientation}" if req.edge_type == "notch" else "flat"
+    )
     req.explanation = (
         f"[Keyword parser] Detected signature: **{req.signature}**, "
-        f"{req.num_wafers} wafer(s), {int(req.diameter)} mm diameter."
+        f"{req.num_wafers} wafer(s), {int(req.diameter)} mm diameter, "
+        f"{req.die_width}×{req.die_height} mm dies, {edge_str} edge."
     )
     if req.street_width > 0:
-        req.explanation += f" Street width: {req.street_width} mm."
+        req.explanation += _format_street_width(req.street_width)
     if req.signature == "Reticle Pattern":
         req.explanation += (
             f" Reticle layout: {req.dies_per_reticle_x}×{req.dies_per_reticle_y} dies/shot."

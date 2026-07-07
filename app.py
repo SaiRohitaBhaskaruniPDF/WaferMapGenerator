@@ -42,7 +42,7 @@ _inject_streamlit_secrets()
 from geometry import WaferConfig, compute_die_grid
 from renderer import render_wafermaps, figure_to_bytes, IMAGE_FORMATS
 from signatures import SIGNATURE_NAMES, BIN_DEFINITIONS, apply_signature
-from llm_agent import parse_user_request, WaferGenRequest, request_to_config
+from llm_agent import parse_user_request, WaferGenRequest, request_to_config, MAX_WAFERS
 from stdf_writer import write_stdf
 
 EXAMPLE_PROMPTS = [
@@ -140,9 +140,13 @@ def _config_summary(config: WaferConfig, sig_name: str = "") -> str:
     parts = [
         f"{int(config.diameter)} mm",
         f"{config.die_width}×{config.die_height} mm dies",
+        (f"notch {config.notch_orientation}" if config.edge_type == "notch" else "flat"),
     ]
     if config.street_width > 0:
-        parts.append(f"{config.street_width} mm street")
+        if config.street_width < 0.1:
+            parts.append(f"{config.street_width * 1000:.0f} µm street")
+        else:
+            parts.append(f"{config.street_width} mm street")
     if sig_name == "Reticle Pattern" or (
         config.dies_per_reticle_x != 2 or config.dies_per_reticle_y != 2
     ):
@@ -153,8 +157,25 @@ def _config_summary(config: WaferConfig, sig_name: str = "") -> str:
     return " · ".join(parts)
 
 
-def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix):
-    """Compact download row for chat or manual results."""
+def _build_zip_bytes(all_wafers, titles, config, fmt: str) -> bytes:
+    """Render each wafer individually and pack into a ZIP archive."""
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for wafer, title in zip(all_wafers, titles):
+            fig_w = render_wafermaps([wafer], config, titles=[title])
+            zf.writestr(f"{title}.{fmt}", figure_to_bytes(fig_w, fmt=fmt))
+            plt.close(fig_w)
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
+def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix, precomputed=None):
+    """Compact download row for chat or manual results.
+
+    Uses a per-entry, per-format session-state cache so that images and ZIPs are
+    never recomputed on Streamlit re-renders — only when a new image format is
+    selected for the first time.
+    """
     img_fmt = st.selectbox(
         "Image format",
         IMAGE_FORMATS,
@@ -162,52 +183,69 @@ def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix):
         key=f"{key_prefix}_img_fmt",
     )
 
+    # One cache dict per chat/manual entry, persists across re-renders
+    cache_key = f"_dl_cache_{key_prefix}"
+    if cache_key not in st.session_state:
+        # Seed with any bytes already computed during generation
+        st.session_state[cache_key] = dict(precomputed) if precomputed else {}
+    cache = st.session_state[cache_key]
+
+    # Ensure CSV and STDF are cached (format-agnostic)
+    if "csv" not in cache:
+        cache["csv"] = df.to_csv(index=False).encode("utf-8")
+    if "stdf" not in cache:
+        program = df["Program"].iloc[0] if not df.empty else "DEMO"
+        cache["stdf"] = write_stdf(lot_id, program, titles, all_wafers)
+
+    # Ensure grid bytes for the selected format are cached
+    fmt_cache = cache.get(img_fmt, {})
+    if "grid" not in fmt_cache:
+        with st.spinner(f"Rendering {img_fmt.upper()} grid…"):
+            fig_grid = render_wafermaps(all_wafers, config, titles=titles)
+            fmt_cache["grid"] = figure_to_bytes(fig_grid, fmt=img_fmt)
+            plt.close(fig_grid)
+        cache[img_fmt] = fmt_cache
+
+    # Ensure ZIP bytes for the selected format are cached (deferred until needed)
+    if "zip" not in fmt_cache:
+        with st.spinner(f"Building {img_fmt.upper()} ZIP ({len(all_wafers)} wafers)…"):
+            fmt_cache["zip"] = _build_zip_bytes(all_wafers, titles, config, fmt=img_fmt)
+        cache[img_fmt] = fmt_cache
+
     r1c1, r1c2 = st.columns(2)
     with r1c1:
         st.download_button(
             "CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
+            data=cache["csv"],
             file_name=f"{lot_id}_wafer_data.csv",
             mime="text/csv",
             use_container_width=True,
             key=f"{key_prefix}_csv",
         )
     with r1c2:
-        program = df["Program"].iloc[0] if not df.empty else "DEMO"
         st.download_button(
             "STDF",
-            data=write_stdf(lot_id, program, titles, all_wafers),
+            data=cache["stdf"],
             file_name=f"{lot_id}_wafer_data.stdf",
             mime="application/octet-stream",
             use_container_width=True,
             key=f"{key_prefix}_stdf",
         )
 
-    fig_grid = render_wafermaps(all_wafers, config, titles=titles)
-    grid_bytes = figure_to_bytes(fig_grid, fmt=img_fmt)
-    plt.close(fig_grid)
-
     r2c1, r2c2 = st.columns(2)
     with r2c1:
         st.download_button(
             f"Grid ({img_fmt.upper()})",
-            data=grid_bytes,
+            data=cache[img_fmt]["grid"],
             file_name=f"{lot_id}_wafermap.{img_fmt}",
             mime=f"image/{img_fmt}" if img_fmt != "svg" else "image/svg+xml",
             use_container_width=True,
             key=f"{key_prefix}_grid",
         )
     with r2c2:
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for wafer, title in zip(all_wafers, titles):
-                fig_w = render_wafermaps([wafer], config, titles=[title])
-                zf.writestr(f"{title}.{img_fmt}", figure_to_bytes(fig_w, fmt=img_fmt))
-                plt.close(fig_w)
-        zip_buf.seek(0)
         st.download_button(
             f"ZIP per wafer ({img_fmt.upper()})",
-            data=zip_buf,
+            data=cache[img_fmt]["zip"],
             file_name=f"{lot_id}_individual_maps_{img_fmt}.zip",
             mime="application/zip",
             use_container_width=True,
@@ -215,7 +253,8 @@ def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix):
         )
 
 
-def _render_chat_result(all_wafers, config, titles, df, lot_id, sig_name, key_prefix):
+def _render_chat_result(all_wafers, config, titles, df, lot_id, sig_name, key_prefix,
+                        preview_bytes=None, precomputed=None):
     """Inline wafer maps and downloads inside an assistant chat message."""
     yields = _compute_yields(all_wafers)
     total_dies = len(all_wafers[0]) if all_wafers else 0
@@ -227,11 +266,14 @@ def _render_chat_result(all_wafers, config, titles, df, lot_id, sig_name, key_pr
         f"{_config_summary(config, sig_name)}"
     )
 
-    fig = render_wafermaps(all_wafers, config, titles=titles)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+    if preview_bytes:
+        st.image(preview_bytes, use_container_width=True)
+    else:
+        fig = render_wafermaps(all_wafers, config, titles=titles)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
 
-    _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix)
+    _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix, precomputed=precomputed)
 
     with st.expander("Yield summary & CSV preview"):
         summary_rows = []
@@ -250,15 +292,23 @@ def _render_chat_result(all_wafers, config, titles, df, lot_id, sig_name, key_pr
 
 def _process_chat_request(user_input: str) -> dict:
     """Parse prompt, generate wafers, return assistant message dict."""
-    api_key = st.session_state.get("ai_api_key", "")
-    azure_endpoint = st.session_state.get("ai_azure_endpoint", "")
-    azure_deployment = st.session_state.get("ai_azure_deployment", "")
+    api_key = st.session_state.get("ai_api_key") or os.environ.get("AZURE_OPENAI_API_KEY") or None
+    azure_endpoint = (
+        st.session_state.get("ai_azure_endpoint")
+        or os.environ.get("AZURE_OPENAI_ENDPOINT")
+        or None
+    )
+    azure_deployment = (
+        st.session_state.get("ai_azure_deployment")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or None
+    )
 
     req: WaferGenRequest = parse_user_request(
         user_input,
-        api_key=api_key or None,
-        azure_endpoint=azure_endpoint or None,
-        azure_deployment=azure_deployment or None,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
+        azure_deployment=azure_deployment,
     )
 
     config = request_to_config(req)
@@ -266,6 +316,20 @@ def _process_chat_request(user_input: str) -> dict:
     all_wafers, titles, df = _generate_wafers(
         config, req.signature, req.num_wafers, req.lot_id, req.program,
     )
+
+    preview_fig = render_wafermaps(all_wafers, config, titles=titles)
+    preview_bytes = figure_to_bytes(preview_fig, fmt="png")
+    plt.close(preview_fig)
+
+    # Pre-compute format-agnostic bytes and seed the PNG grid cache with the
+    # preview render (already done above — zero extra cost).
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    stdf_bytes = write_stdf(req.lot_id, req.program, titles, all_wafers)
+    precomputed = {
+        "png": {"grid": preview_bytes},  # ZIP deferred until user requests it
+        "csv": csv_bytes,
+        "stdf": stdf_bytes,
+    }
 
     method = "Azure GPT" if req.used_llm else "keyword parser"
     content = (
@@ -284,6 +348,8 @@ def _process_chat_request(user_input: str) -> dict:
             "df": df,
             "lot_id": req.lot_id,
             "sig": req.signature,
+            "preview_bytes": preview_bytes,
+            "precomputed": precomputed,
         },
     }
 
@@ -406,6 +472,8 @@ def _render_chat_page() -> None:
                 _render_chat_result(
                     r["all_wafers"], r["config"], r["titles"], r["df"],
                     r["lot_id"], r["sig"], key_prefix=f"chat_{idx}",
+                    preview_bytes=r.get("preview_bytes"),
+                    precomputed=r.get("precomputed"),
                 )
 
     if not st.session_state["chat_history"]:
@@ -426,6 +494,13 @@ def _render_manual_page() -> None:
         with c1:
             diameter = st.number_input("Wafer diameter (mm)", 50.0, 450.0, 300.0, 1.0)
             edge_type = st.radio("Edge type", ["notch", "flat"], horizontal=True)
+            notch_orientation = st.radio(
+                "Notch orientation",
+                ["down", "up", "left", "right"],
+                horizontal=True,
+                disabled=(edge_type == "flat"),
+                help="Which direction the notch points (ignored for flat edge)",
+            )
             edge_exclusion = st.slider("Edge exclusion (mm)", 1.0, 5.0, 3.0, 0.5)
             signature_type = st.selectbox("Signature", SIGNATURE_NAMES)
         with c2:
@@ -434,7 +509,7 @@ def _render_manual_page() -> None:
             street_width = st.number_input("Street width (mm)", 0.0, 5.0, 0.0, 0.05)
             lot_id = st.text_input("Lot ID", "LOT_001")
             program = st.text_input("Program", "HBN_PRD020")
-            num_wafers = st.slider("Number of wafers", 1, 25, 4)
+            num_wafers = st.slider("Number of wafers", 1, MAX_WAFERS, 4)
 
         with st.expander("Grid offset"):
             x_offset = st.number_input("X offset (mm)", -10.0, 10.0, 0.0, 0.5)
@@ -479,11 +554,17 @@ def _render_manual_page() -> None:
             dies_per_reticle_y=dpr_y,
             reticle_fail_die_x=int(reticle_fail_die_x) % dpr_x,
             reticle_fail_die_y=int(reticle_fail_die_y) % dpr_y,
+            notch_orientation=notch_orientation if edge_type == "notch" else "down",
         )
         with st.spinner("Generating…"):
             all_wafers, titles, df = _generate_wafers(
                 config, signature_type, num_wafers, lot_id, program,
             )
+            preview_fig = render_wafermaps(all_wafers, config, titles=titles)
+            preview_bytes = figure_to_bytes(preview_fig, fmt="png")
+            plt.close(preview_fig)
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            stdf_bytes = write_stdf(lot_id, program, titles, all_wafers)
         st.session_state["manual_result"] = {
             "all_wafers": all_wafers,
             "config": config,
@@ -491,7 +572,15 @@ def _render_manual_page() -> None:
             "df": df,
             "lot_id": lot_id,
             "sig": signature_type,
+            "preview_bytes": preview_bytes,
+            "precomputed": {
+                "png": {"grid": preview_bytes},
+                "csv": csv_bytes,
+                "stdf": stdf_bytes,
+            },
         }
+        # Clear any stale download cache for this entry
+        st.session_state.pop("_dl_cache_manual", None)
 
     if "manual_result" in st.session_state:
         r = st.session_state["manual_result"]
@@ -499,6 +588,8 @@ def _render_manual_page() -> None:
         _render_chat_result(
             r["all_wafers"], r["config"], r["titles"], r["df"],
             r["lot_id"], r["sig"], key_prefix="manual",
+            preview_bytes=r.get("preview_bytes"),
+            precomputed=r.get("precomputed"),
         )
 
 
