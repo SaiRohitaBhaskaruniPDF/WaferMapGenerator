@@ -25,6 +25,9 @@ from typing import Dict, List, Tuple
 from signatures import BIN_DEFINITIONS, DieResult, PASS_BIN
 
 # Allowed sizes from the spec.
+"""Your generator uses ~33 internal bins (in BIN_DEFINITIONS) that carry the signature meaning and map colors.
+ build_bin_map translates those internal bins into the user's chosen hardbin/softbin space. Pass is pinned to (1, 1); 
+fail bins cycle through the available fail hardbins:"""
 HARDBIN_CHOICES = (16, 64, 256)
 SOFTBIN_MULTIPLIERS = (4, 16, 64)
 
@@ -40,7 +43,9 @@ def build_bin_map(hardbin_count: int = 16,
     hardbin_count = int(hardbin_count)
     softbin_multiplier = int(softbin_multiplier)
     n_fail_bins = hardbin_count - 1  # hardbin 1 is reserved for PASS
-
+    """One nuance: with only 16 hardbins, your ~32 internal fail causes share the 15 fail hardbins (they wrap via % n_fail_bins); with 256 hardbins each cause gets its own.
+      The mapping is deterministic, so the same failure cause always lands in the same bin across wafers — that's what makes the exports reproducible. map_wafer_bins (lines 59–72) then applies it per wafer, called from generator.py lines 222–225.
+    """
     mapping: Dict[int, Tuple[int, int]] = {}
     for internal in sorted(BIN_DEFINITIONS):
         if internal == PASS_BIN:

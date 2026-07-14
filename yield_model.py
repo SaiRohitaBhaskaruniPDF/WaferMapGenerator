@@ -17,7 +17,7 @@ This module sits BETWEEN the spatial signatures and the exporters:
      * yield too low  -> revive a random subset of failed dies (this thins
        the signature pattern instead of erasing it).
 
-2. CP insertion cascade (CP1 / CP2 / CP3)
+2. CP insertion cascade (CP1 / CP2 / CP3) (survivors move to the next stage)
    CP = Circuit Probe = wafer sort. Each insertion is typically run at a
    different temperature (CP1 room, CP2 cold, CP3 hot). Spec rules:
      * CP1 pass/fail comes from the yield model + signature.

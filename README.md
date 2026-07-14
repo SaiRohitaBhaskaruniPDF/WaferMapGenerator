@@ -12,7 +12,7 @@ You describe the scenario (form or natural language), the app generates realisti
 
 ## Features
 
-- **33 spatial signatures** — Edge Ring, Center Cluster, Scratch families, Reticle Pattern (hard & soft repeaters), Striping (lens tilt), Mixed Mode, and more
+- **37 spatial signatures** — Edge Ring, Center Cluster, Scratch families, Reticle Pattern (hard & soft repeaters), Striping (lens tilt), Mixed Mode, and more
 - **Spec-compliant geometry** — 150/200/300 mm wafers with auto flat/notch, 1–10 mm edge exclusion, die aspect-ratio validation (1:2 to 2:1), 0.05–0.2 mm scribe street, auto stepping field
 - **Yield model** — direct yield % or defect density via `Y = e^(-A·D)` (Poisson)
 - **CP1/CP2/CP3 insertions** — retest cascade where CP2/CP3 keep 90–99.9% of prior passers
@@ -42,6 +42,21 @@ You describe the scenario (form or natural language), the app generates realisti
 | `renderer.py` | Draws wafer map images |
 | `llm_agent.py` | Parses chat prompts into generation parameters |
 | `stdf_writer.py` | Builds STDF binary output |
+| `Spec_Implementation_Audit.md` | Spec-by-spec map of what is implemented, where, and how |
+
+## Spec coverage & known limitations
+
+See [`Spec_Implementation_Audit.md`](Spec_Implementation_Audit.md) for a full spec-by-spec
+breakdown. Summary:
+
+- **All Must-Have items (1–12) are implemented**, plus most Nice-To-Haves (lot numbers,
+  lot sequence, test time, multi-site, site-to-site yield loss).
+- **Known limitations:**
+  - *Splits / child lots (`.01`, `.02`)* — `fab.make_lot_id()` supports the suffix, but it
+    is not yet wired into the UI or generation pipeline.
+  - *Repair (virgin vs repaired good die)* — intentional placeholder; not implemented.
+  - *Parametric values* are currently drawn from a **uniform** distribution (not Gaussian);
+    a documented simplification.
 
 ## Requirements
 
@@ -83,9 +98,9 @@ The easiest way to share a live link is [Streamlit Community Cloud](https://shar
 
 ### 1. Deploy the app
 
-1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with **GitHub** (`SaiRohitaBhaskaruni01`).
+1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with **GitHub** (`SaiRohitaBhaskaruniPDF`).
 2. Click **Create app**.
-3. Select repository: `SaiRohitaBhaskaruni01/WaferMapGenerator`
+3. Select repository: `SaiRohitaBhaskaruniPDF/WaferMapGenerator`
 4. Branch: `main`
 5. Main file: `app.py`
 6. Click **Deploy**.

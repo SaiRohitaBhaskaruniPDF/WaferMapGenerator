@@ -120,7 +120,7 @@ Generate synthetic wafer maps for demonstration, benchmarking and Software QA pu
     front differs too). Verbose lengths 31/63/127/255.
 
 ### 12. Yield Patterns
-- **12a Steve's list:** 🟡 *Your doc placeholder.* The code already implements **~33
+- **12a Steve's list:** 🟡 *Your doc placeholder.* The code already implements **37
   named spatial signatures** in `signatures.py` → `SIGNATURE_NAMES` (edge ring, center
   cluster, donut, bull's-eye, scratch families, quadrant, wedge, spokes, rings, etc.).
   These are selectable individually or layered (`compose_signatures()`). **Action for
@@ -213,7 +213,7 @@ Generate synthetic wafer maps for demonstration, benchmarking and Software QA pu
 | 9 | Test insertions (CP cascade) | ✅ |
 | 10 | Number of bins | ✅ |
 | 11 | Test items (count/shapes/names) | ✅ |
-| 12a | Steve's list | 🟡 (paste list; ~33 signatures already exist) |
+| 12a | Steve's list | 🟡 (paste list; 37 signatures already exist) |
 | 12b | Repeaters + auto stepping field | ✅ |
 | 12b-iii-1 | Soft repeaters | ✅ |
 | 12b-iii-2 | Striping | ✅ |
