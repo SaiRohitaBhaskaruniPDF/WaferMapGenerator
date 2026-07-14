@@ -74,8 +74,11 @@ def _draw_single_wafer(ax, dies_with_bins: List[DieResult], config: WaferConfig,
         )
         ax.add_patch(rect)
 
-    # Notch: small wedge cut from the wafer edge at the requested orientation
+    # Edge marker. Both marker types honor config.edge_orientation, which says
+    # which side of the map the notch / flat sits on (90-degree steps only).
+    orientation = getattr(config, "edge_orientation", "down")
     if config.edge_type == "notch":
+        # Notch: small wedge cut from the wafer edge at the requested side.
         notch_size = radius * 0.035
         _NOTCH_PARAMS = {
             "down":  {"center": (0,       -radius), "theta1": 60,  "theta2": 120},
@@ -83,19 +86,27 @@ def _draw_single_wafer(ax, dies_with_bins: List[DieResult], config: WaferConfig,
             "left":  {"center": (-radius,  0),      "theta1": -30, "theta2": 30},
             "right": {"center": ( radius,  0),      "theta1": 150, "theta2": 210},
         }
-        p = _NOTCH_PARAMS.get(getattr(config, "notch_orientation", "down"),
-                               _NOTCH_PARAMS["down"])
+        p = _NOTCH_PARAMS.get(orientation, _NOTCH_PARAMS["down"])
         ax.add_patch(patches.Wedge(
             p["center"], notch_size, p["theta1"], p["theta2"],
             color=BG_COLOR, zorder=4
         ))
-    # Flat: cut the bottom of the circle with a dark rectangle
     elif config.edge_type == "flat":
-        flat_y = -(radius * 0.82)
+        # Flat: mask the circle with a dark rectangle beyond the chord line at
+        # 82% of the radius, rotated to the requested side (150 mm wafers).
+        flat_pos = radius * 0.82   # distance from center to the flat chord
+        span = radius * 2.2        # rectangle long side (covers the full disc)
+        depth = radius * 1.1 - flat_pos  # rectangle short side (outside chord)
+        _FLAT_PARAMS = {
+            # (lower-left corner x, y, width, height) of the masking rectangle
+            "down":  (-radius * 1.1, -radius * 1.1, span, depth),
+            "up":    (-radius * 1.1, flat_pos,      span, depth),
+            "left":  (-radius * 1.1, -radius * 1.1, depth, span),
+            "right": (flat_pos,      -radius * 1.1, depth, span),
+        }
+        fx, fy, fw, fh = _FLAT_PARAMS.get(orientation, _FLAT_PARAMS["down"])
         ax.add_patch(patches.Rectangle(
-            (-radius * 1.1, -radius * 1.1),
-            radius * 2.2, (radius * 1.1 + flat_y),
-            color=BG_COLOR, zorder=4
+            (fx, fy), fw, fh, color=BG_COLOR, zorder=4
         ))
 
     # Wafer outline circle

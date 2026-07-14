@@ -12,22 +12,33 @@ You describe the scenario (form or natural language), the app generates realisti
 
 ## Features
 
-- **29 spatial signatures** — Edge Ring, Center Cluster, Scratch, Random Scatter, Reticle Pattern, Mixed Mode, and more
-- **Manual configuration tab** — sliders and dropdowns for wafer diameter, die size, edge exclusion, lot metadata
+- **33 spatial signatures** — Edge Ring, Center Cluster, Scratch families, Reticle Pattern (hard & soft repeaters), Striping (lens tilt), Mixed Mode, and more
+- **Spec-compliant geometry** — 150/200/300 mm wafers with auto flat/notch, 1–10 mm edge exclusion, die aspect-ratio validation (1:2 to 2:1), 0.05–0.2 mm scribe street, auto stepping field
+- **Yield model** — direct yield % or defect density via `Y = e^(-A·D)` (Poisson)
+- **CP1/CP2/CP3 insertions** — retest cascade where CP2/CP3 keep 90–99.9% of prior passers
+- **Configurable bins** — 16/64/256 hardbins, softbins ×4/×16/×64
+- **Test items** — 100..1M tests, pass/fail vs parametric split, five parametric data shapes, verbose test-name modes for UI stress testing
+- **Fab realism** — FYYWWSSSS lot numbers, multi-lot time sequences for trend charts, 1–600 s test time, multi-site (1–16 sites from GDPW) with layout patterns and site-to-site yield loss
+- **Manual configuration tab** — every parameter above as a form control
 - **AI Chat Assistant tab** — natural language input via Azure OpenAI (GPT-4.1) with keyword-parser fallback
 - **Exports**
-  - CSV with die-level bin data (`dieX`, `dieY`, `Bin`, `BinName`, `BinState`, `BinDesc`)
-  - PNG wafer map grid
-  - ZIP of individual wafer PNGs
-  - STDF v4 binary (FAR, MIR, WIR/WRR, PIR/PRR, HBR/SBR, MRR)
+  - CSV with die-level data (`Insertion`, `Bin`, `HardBin`, `SoftBin`, `Site`, coordinates, bin metadata)
+  - Optional long-format per-test CSV
+  - PNG/SVG/JPEG/TIFF wafer map grid and per-wafer ZIP
+  - STDF v4 binary per lot per insertion (FAR, MIR, SDR, WIR/WRR, PIR/PTR/PRR, TSR, HBR/SBR, MRR)
 
 ## Project structure
 
 | File | Role |
 |------|------|
-| `app.py` | Streamlit web UI |
-| `geometry.py` | Computes die grid positions inside the wafer circle |
-| `signatures.py` | Applies spatial defect patterns and bin definitions |
+| `app.py` | Streamlit web UI (chat + manual form) |
+| `generator.py` | The pipeline: signature → yield → CP cascade → bins → exports |
+| `geometry.py` | Die grid, spec limits, auto flat/notch, auto stepping field |
+| `signatures.py` | Spatial defect patterns and internal bin definitions |
+| `yield_model.py` | Direct/defect-density yield targets, CP retest cascade, S2S |
+| `binning.py` | Internal bin → hardbin/softbin mapping |
+| `test_items.py` | Test names, parametric/pass-fail values, data shapes |
+| `fab.py` | Fab lot numbers, lot schedules, multi-site, test-time math |
 | `renderer.py` | Draws wafer map images |
 | `llm_agent.py` | Parses chat prompts into generation parameters |
 | `stdf_writer.py` | Builds STDF binary output |

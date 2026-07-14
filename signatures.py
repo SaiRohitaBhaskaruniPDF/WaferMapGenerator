@@ -71,6 +71,99 @@ BIN_DEFINITIONS = {
          "description": "Radial spoke — fan-shaped radial defect streaks"},
     25: {"name": "MIXED_MODE",      "state": "F", "color": "#EF9A9A",
          "description": "Mixed-mode — combination of edge ring + center cluster"},
+    # ----------------------------------------------------------------------
+    # Bins 26-29: "scratch family" bins.
+    # A plain scratch (bin 4) just says "there is a linear scratch."
+    # These four bins go further and encode the *root cause* (which tool /
+    # process made the scratch), because in a real fab the geometry of a
+    # scratch is a fingerprint that points back to the equipment that caused it.
+    # Each still has state "F" (fail) — the extra meaning lives in the name +
+    # description, and in the SCRATCH_FAMILIES table just below.
+    # ----------------------------------------------------------------------
+    26: {"name": "HANDLER_SCRATCH", "state": "F", "color": "#7E57C2",
+         "description": "Robotic-handler scratch — straight line, same angle on every "
+                        "wafer in the lot (misaligned end-effector / aligner pin)"},
+    27: {"name": "SLOT_SCRATCH",    "state": "F", "color": "#5C6BC0",
+         "description": "Cassette / FOUP slot scratch — short mark near the wafer edge, "
+                        "repeats on every wafer (worn or damaged carrier slot)"},
+    28: {"name": "WAND_SCRATCH",    "state": "F", "color": "#AB47BC",
+         "description": "Manual wafer-wand scratch — irregular / squiggly, random per "
+                        "wafer, may appear on only some wafers (hand transfer by operator)"},
+    29: {"name": "CMP_ARC_SCRATCH", "state": "F", "color": "#26A69A",
+         "description": "CMP arc scratch — curved arc following the polish-pad sweep "
+                        "radius (slurry agglomerate / pad debris dragged across surface)"},
+    # ----------------------------------------------------------------------
+    # Bins 30-33: added for the 2026.07.10 spec.
+    #   30 = striping (lens-tilt yield loss along one stepping-field edge)
+    #   31/32 = dies that passed the previous insertion but failed CP2/CP3
+    #   33 = site-correlated loss in a multi-site setup (S2S)
+    # ----------------------------------------------------------------------
+    30: {"name": "STRIPE_FAIL",     "state": "F", "color": "#FF7043",
+         "description": "Striping — yield loss along one edge of every stepping "
+                        "field (caused by lens tilt in lithography)"},
+    31: {"name": "CP2_FAIL",        "state": "F", "color": "#90A4AE",
+         "description": "Failed at CP2 retest (passed CP1) — e.g. temperature-"
+                        "sensitive marginal die"},
+    32: {"name": "CP3_FAIL",        "state": "F", "color": "#78909C",
+         "description": "Failed at CP3 retest (passed CP1 and CP2)"},
+    33: {"name": "S2S_FAIL",        "state": "F", "color": "#B0BEC5",
+         "description": "Site-to-site yield loss — die killed by a weak site in "
+                        "the multi-site probe fixture"},
+}
+
+# Bin numbers the pipeline stages use when THEY (not a spatial signature)
+# decide a die fails. Kept as named constants so the yield model, CP cascade
+# and multi-site stages never hard-code magic numbers.
+PASS_BIN = 1
+RANDOM_FAIL_BIN = 5    # yield-model random kills reuse the Random Scatter bin
+STRIPE_BIN = 30
+CP2_FAIL_BIN = 31
+CP3_FAIL_BIN = 32
+S2S_FAIL_BIN = 33
+
+
+# ---------------------------------------------------------------------------
+# Scratch family metadata table
+# ---------------------------------------------------------------------------
+# This is a small "knowledge base" that maps each scratch family to:
+#   - bin        : which bin number it paints failed dies with (ties back to
+#                  BIN_DEFINITIONS above)
+#   - tool       : the equipment / process a process engineer would suspect
+#   - root_cause : the physical mechanism that creates this scratch shape
+#   - lot_repeatable : True  -> the *same* scratch appears on every wafer in the
+#                              lot (a fixed equipment fault touches each wafer
+#                              identically), so its geometry is derived from a
+#                              LOT-level seed.
+#                      False -> it varies wafer-to-wafer (or may be absent on
+#                              some wafers), so its geometry is derived from a
+#                              per-WAFER seed.
+# The UI reads this to show tooltips, and llm_agent.py reads it to teach the
+# language model which family to pick from a described root cause.
+SCRATCH_FAMILIES = {
+    "Robotic Handler Scratch": {
+        "bin": 26,
+        "tool": "Wafer-handling robot / aligner",
+        "root_cause": "Misaligned robot end-effector or aligner pin dragging across the wafer",
+        "lot_repeatable": True,
+    },
+    "Cassette Slot Scratch": {
+        "bin": 27,
+        "tool": "Cassette / FOUP carrier slot",
+        "root_cause": "Worn or damaged carrier slot contacting the wafer edge on load/unload",
+        "lot_repeatable": True,
+    },
+    "Wafer-Wand Scratch": {
+        "bin": 28,
+        "tool": "Manual wafer wand (operator)",
+        "root_cause": "Technician hand-transferring a wafer with a wand — irregular, inconsistent",
+        "lot_repeatable": False,
+    },
+    "CMP Arc Scratch": {
+        "bin": 29,
+        "tool": "CMP (Chemical Mechanical Planarization) polisher",
+        "root_cause": "Large particle / slurry agglomerate / pad debris dragged along the pad sweep",
+        "lot_repeatable": True,
+    },
 }
 
 
@@ -283,6 +376,45 @@ def assign_reticle(dies, dies_per_reticle_x=2, dies_per_reticle_y=2,
             local_y += dpr_y
         if local_x == fail_x and local_y == fail_y and rng.random() < fail_rate:
             results.append(_fail(die, 12))
+        else:
+            results.append(_pass(die))
+    return results
+
+
+def assign_stripe(dies, dies_per_reticle_x=2, dies_per_reticle_y=2,
+                  edge="top", fail_rate=1.0, seed=None):
+    """Striping (bin 30): yield loss along ONE edge of every stepping field.
+
+    Real-world cause: "lens tilt" in lithography — one edge of the exposure
+    field is slightly out of focus, so the same row/column of dies inside
+    EVERY reticle shot underperforms.
+
+    Geometry: compute each die's local position inside its stepping field
+    (die index modulo dies-per-reticle). A die is in the stripe when that
+    local position sits on the requested field edge:
+        top    -> last local row      bottom -> first local row
+        left   -> first local column  right  -> last local column
+
+    fail_rate = 1.0 gives a hard stripe (every stripe die fails); below 1.0
+    gives a soft-repeater-style stripe (spec: 10%..100% selectable).
+    """
+    rng = random.Random(seed)
+    dpr_x = max(1, int(dies_per_reticle_x))
+    dpr_y = max(1, int(dies_per_reticle_y))
+    results = []
+    for die in dies:
+        dieX, dieY, _, _ = die
+        # Local (column, row) inside the stepping field, wrapped to 0..dpr-1.
+        local_x = dieX % dpr_x
+        local_y = dieY % dpr_y
+        in_stripe = (
+            (edge == "top"    and local_y == dpr_y - 1) or
+            (edge == "bottom" and local_y == 0) or
+            (edge == "left"   and local_x == 0) or
+            (edge == "right"  and local_x == dpr_x - 1)
+        )
+        if in_stripe and rng.random() < fail_rate:
+            results.append(_fail(die, 30))
         else:
             results.append(_pass(die))
     return results
@@ -537,6 +669,241 @@ def assign_mixed_mode(dies, radius, edge_exclusion, fail_rate=0.85, seed=None):
 
 
 # ---------------------------------------------------------------------------
+# Scratch family generators (bins 26-29)
+# ---------------------------------------------------------------------------
+# All four share the same core idea as assign_scratch: for every die, measure a
+# geometric distance to some shape (a line, or an arc), and if the die is close
+# enough to that shape AND a random roll beats fail_rate, mark it failed.
+# What differs between them is (a) the *shape* and (b) *where the randomness
+# comes from* (lot-level vs per-wafer), which is what makes each look like a
+# different real-world tool fault.
+
+
+def assign_handler_scratch(dies, angle_deg=45.0, offset_mm=0.0, width_mm=None,
+                           fail_rate=0.90, seed=None):
+    """Robotic-handler scratch (bin 26): one straight line across the wafer.
+
+    Real-world cause: a misaligned wafer-handling robot / aligner pin. Because
+    the SAME mechanical fault touches every wafer the same way, the caller is
+    expected to pass a FIXED angle_deg + offset_mm for the whole lot (derived
+    from a lot-level seed), so the scratch looks identical on every wafer.
+
+    Geometry: a straight line is defined by its normal direction (nx, ny).
+    The signed distance from a point (cx, cy) to a line through the origin is
+    (cx*nx + cy*ny). We shift the line sideways by `offset_mm` so it need not
+    pass exactly through the wafer center. A die fails if it lies within
+    width_mm/2 of that line.
+
+    Parameters
+    ----------
+    angle_deg : orientation of the scratch line (degrees). LOT-level (fixed).
+    offset_mm : how far the line is shifted from the wafer center, along the
+                line's normal. LOT-level (fixed). 0 = passes through center.
+    width_mm  : thickness of the scratch band (dies within +/- width/2 fail).
+    fail_rate : fraction of in-band dies that actually fail (adds realism —
+                a scratch rarely kills 100% of the dies it crosses).
+    seed      : per-WAFER seed, used ONLY for the fail_rate coin-flips so the
+                speckle differs slightly wafer-to-wafer while the line stays put.
+    """
+    rng = random.Random(seed)
+    if width_mm is None:
+        width_mm = 6.0
+    angle_rad = np.radians(angle_deg)
+    # Normal vector of the line (perpendicular to the scratch direction).
+    nx, ny = -np.sin(angle_rad), np.cos(angle_rad)
+    results = []
+    for die in dies:
+        _, _, cx, cy = die
+        # Signed distance to the line, then remove the lot-level offset.
+        dist_from_line = abs(cx * nx + cy * ny - offset_mm)
+        if dist_from_line <= width_mm / 2 and rng.random() < fail_rate:
+            results.append(_fail(die, 26))
+        else:
+            results.append(_pass(die))
+    return results
+
+
+def assign_slot_scratch(dies, radius, edge_exclusion, angle_deg=0.0,
+                        depth_mm=None, arc_span_deg=45.0, width_mm=None,
+                        fail_rate=0.90, seed=None):
+    """Cassette / FOUP slot scratch (bin 27): a SHORT mark near the wafer edge.
+
+    Real-world cause: a worn/damaged carrier slot rubbing the wafer edge as it
+    slides in or out. It is localized to the edge and to one side of the wafer,
+    and (like the handler scratch) repeats on every wafer, so angle_deg is a
+    LOT-level parameter.
+
+    Geometry: instead of a full-diameter line, we fail dies that are BOTH
+      (a) near the edge  -> distance from center between (active_r - depth) and active_r
+      (b) near one side  -> polar angle within +/- arc_span/2 of angle_deg
+    That combination carves out a short scratch hugging the rim.
+
+    Parameters
+    ----------
+    radius, edge_exclusion : wafer geometry (to locate the usable edge).
+    angle_deg    : which side of the wafer the slot mark sits on. LOT-level.
+    depth_mm     : how far inward from the edge the mark reaches.
+    arc_span_deg : angular length of the mark (bigger = longer scratch).
+    width_mm     : unused placeholder kept for signature symmetry / future use.
+    fail_rate    : fraction of in-region dies that fail.
+    seed         : per-WAFER seed for the fail_rate coin-flips only.
+    """
+    rng = random.Random(seed)
+    active_r = radius - edge_exclusion
+    if depth_mm is None:
+        depth_mm = radius * 0.18
+    center_angle = np.radians(angle_deg)
+    half_arc = np.radians(arc_span_deg / 2)
+    results = []
+    for die in dies:
+        _, _, cx, cy = die
+        dist = np.sqrt(cx**2 + cy**2)
+        # Polar angle of this die, wrapped to [0, 2*pi).
+        ang = np.arctan2(cy, cx) % (2 * np.pi)
+        # Smallest angular gap between the die and the mark's center angle.
+        d_ang = abs((ang - (center_angle % (2 * np.pi)) + np.pi) % (2 * np.pi) - np.pi)
+        near_edge = dist >= (active_r - depth_mm)
+        near_side = d_ang <= half_arc
+        if near_edge and near_side and rng.random() < fail_rate:
+            results.append(_fail(die, 27))
+        else:
+            results.append(_pass(die))
+    return results
+
+
+def assign_wand_scratch(dies, radius, width_mm=None, presence_prob=0.6,
+                        fail_rate=0.88, seed=None):
+    """Manual wafer-wand scratch (bin 28): irregular, squiggly, per-wafer.
+
+    Real-world cause: an operator hand-transferring a wafer with a wand. Because
+    it is done by hand, it is inconsistent: the angle, position, curviness and
+    even whether it appears at all change from wafer to wafer. So EVERYTHING
+    here is driven by the per-WAFER seed.
+
+    Geometry: we start from a straight line (like a scratch) but add a sine-wave
+    "wiggle" to it so it looks hand-drawn rather than machine-straight. We work
+    in a rotated coordinate frame:
+        along = distance measured ALONG the scratch direction
+        perp  = distance measured PERPENDICULAR to it
+    A die fails if its perpendicular distance to the wiggling center line is
+    within width/2, i.e. abs(perp - wiggle(along)) <= width/2.
+
+    Parameters
+    ----------
+    radius        : wafer radius (used to scale wiggle amplitude / frequency).
+    width_mm      : thickness of the scratch band.
+    presence_prob : probability THIS wafer has a wand scratch at all. With the
+                    remaining probability the whole wafer comes back all-pass,
+                    which is why wand scratches show up on only some wafers.
+    fail_rate     : fraction of in-band dies that fail.
+    seed          : per-WAFER seed controlling angle, position, wiggle AND
+                    presence — all of it varies wafer-to-wafer.
+    """
+    rng = random.Random(seed)
+
+    # Roll for presence first: some wafers simply have no wand scratch.
+    if rng.random() > presence_prob:
+        return [_pass(die) for die in dies]
+
+    if width_mm is None:
+        width_mm = 6.0
+
+    # Random orientation and sideways offset for this wafer's scratch.
+    angle_rad = np.radians(rng.uniform(0.0, 180.0))
+    offset_mm = rng.uniform(-radius * 0.4, radius * 0.4)
+
+    # Direction unit vector (along the scratch) and its normal (perpendicular).
+    tx, ty = np.cos(angle_rad), np.sin(angle_rad)   # along
+    nx, ny = -np.sin(angle_rad), np.cos(angle_rad)  # perpendicular
+
+    # Random "hand-drawn" wiggle: amplitude in mm, spatial frequency in 1/mm.
+    amp = rng.uniform(radius * 0.05, radius * 0.18)
+    freq = rng.uniform(1.5, 4.0) / radius
+    phase = rng.uniform(0.0, 2 * np.pi)
+
+    results = []
+    for die in dies:
+        _, _, cx, cy = die
+        along = cx * tx + cy * ty            # position along the scratch
+        perp = cx * nx + cy * ny - offset_mm  # distance from the base line
+        wiggle = amp * np.sin(freq * along + phase)  # the squiggle
+        if abs(perp - wiggle) <= width_mm / 2 and rng.random() < fail_rate:
+            results.append(_fail(die, 28))
+        else:
+            results.append(_pass(die))
+    return results
+
+
+def assign_cmp_arc_scratch(dies, radius, arc_radius=None, arc_width=None,
+                           center_offset=None, angle_start=None,
+                           arc_span_deg=140.0, fail_rate=0.90, seed=None):
+    """CMP arc scratch (bin 29): a CURVED arc, not a straight line.
+
+    Real-world cause: during Chemical Mechanical Planarization a large particle
+    (slurry agglomerate / pad debris) gets dragged across the wafer. Because the
+    pad and conditioner sweep in circles, the resulting scratch is a CURVE that
+    follows the pad-sweep radius rather than a straight diameter line. It tends
+    to recur at a similar radius across the lot (tool kinematics), so arc_radius
+    and the arc center are LOT-level parameters.
+
+    Geometry: define a circle of radius `arc_radius` centered at a point that is
+    OFFSET from the wafer center (the pad's rotation center is not the wafer
+    center). A die fails if its distance to that circle is within arc_width/2
+    (so it hugs the circular band) AND it falls within the arc's angular span
+    (an arc is only PART of a full circle).
+
+    Parameters
+    ----------
+    radius        : wafer radius (used for sensible defaults).
+    arc_radius    : radius of the pad-sweep circle the scratch follows. LOT-level.
+    arc_width     : thickness of the arc band.
+    center_offset : (dx, dy) offset of the arc's center from the wafer center.
+                    LOT-level. Defaults to a point off to one side.
+    angle_start   : starting polar angle of the visible arc (radians), measured
+                    around the ARC's center. LOT-level.
+    arc_span_deg  : angular length of the arc in degrees (how much of the circle
+                    is actually scratched).
+    fail_rate     : fraction of in-band dies that fail.
+    seed          : per-WAFER seed for the fail_rate coin-flips only.
+    """
+    rng = random.Random(seed)
+    if arc_radius is None:
+        arc_radius = radius * 0.9
+    if arc_width is None:
+        arc_width = radius * 0.10
+    if center_offset is None:
+        # Push the arc center off to the side so the visible arc curves through
+        # the wafer instead of being a concentric ring around the middle.
+        center_offset = (radius * 0.7, 0.0)
+    if angle_start is None:
+        angle_start = np.pi * 0.6
+
+    ox, oy = center_offset
+    a_start = angle_start % (2 * np.pi)
+    a_end = (angle_start + np.radians(arc_span_deg)) % (2 * np.pi)
+
+    results = []
+    for die in dies:
+        _, _, cx, cy = die
+        # Position of the die relative to the ARC's center (not wafer center).
+        dx, dy = cx - ox, cy - oy
+        r = np.sqrt(dx**2 + dy**2)
+        ang = np.arctan2(dy, dx) % (2 * np.pi)
+        # Close to the circular band of radius arc_radius?
+        on_band = abs(r - arc_radius) <= arc_width / 2
+        # Within the visible angular span? (handle the wrap-around case)
+        if a_end >= a_start:
+            in_span = a_start <= ang <= a_end
+        else:
+            in_span = ang >= a_start or ang <= a_end
+        if on_band and in_span and rng.random() < fail_rate:
+            results.append(_fail(die, 29))
+        else:
+            results.append(_pass(die))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -570,6 +937,19 @@ SIGNATURE_NAMES = [
     "Peripheral Spot",
     "Radial Spokes",
     "Mixed Mode (Edge + Center)",
+    # Striping (bin 30) — lens-tilt yield loss along one edge of every
+    # stepping field. Four variants, one per field edge (per spec).
+    "Striping — Top",
+    "Striping — Bottom",
+    "Striping — Left",
+    "Striping — Right",
+    # Scratch families (bins 26-29) — each is a scratch whose SHAPE points to
+    # the specific tool/process that caused it. Names here must exactly match
+    # the keys of SCRATCH_FAMILIES above so the two tables stay in sync.
+    "Robotic Handler Scratch",
+    "Cassette Slot Scratch",
+    "Wafer-Wand Scratch",
+    "CMP Arc Scratch",
 ]
 
 """
@@ -580,10 +960,32 @@ There's also SIGNATURE_NAMES — a list of all 29 pattern names, used to populat
 
 """
 def apply_signature(dies: List[Die], signature_type: str,
-                    config: WaferConfig, seed: int = None) -> List[DieResult]:
-    """Apply a named spatial signature and return die results."""
+                    config: WaferConfig, seed: int = None,
+                    lot_seed: int = None) -> List[DieResult]:
+    """Apply a named spatial signature and return die results.
+
+    Parameters
+    ----------
+    seed : the PER-WAFER seed. Controls wafer-to-wafer variation (the random
+           fail_rate coin-flips, and per-wafer patterns like the wand scratch).
+    lot_seed : the LOT-level seed, shared by every wafer in the lot. Used to
+           derive the geometry of "lot-repeatable" defects (handler scratch
+           angle, slot-scratch side, CMP arc radius) so those look IDENTICAL on
+           every wafer. If not given, we fall back to `seed` so old callers that
+           only pass a per-wafer seed keep working exactly as before.
+    """
     radius = config.diameter / 2.0
     ee     = config.edge_exclusion
+
+    # Backward compatibility: if the caller didn't split lot vs wafer seeds,
+    # treat the wafer seed as the lot seed too.
+    if lot_seed is None:
+        lot_seed = seed
+
+    # A dedicated RNG seeded from the LOT seed. Every wafer in the lot builds
+    # this the same way, so any geometry drawn from `lot_rng` is stable across
+    # the lot (that is what makes an equipment fault "repeat" wafer-to-wafer).
+    lot_rng = random.Random(lot_seed)
 
     s = signature_type
     if s == "Edge Ring":
@@ -623,12 +1025,27 @@ def apply_signature(dies: List[Die], signature_type: str,
                                spot_y=r_val * np.sin(angle),
                                spot_r=radius * 0.14, seed=seed)
     elif s == "Reticle Pattern":
+        # Repeaters: fail rate 1.0 = classic hard repeater (the same reticle
+        # position fails on every shot). Below 1.0 = "soft repeater" — the
+        # position fails only part of the time (spec: 10%..100% selectable).
         return assign_reticle(
             dies,
             dies_per_reticle_x=config.dies_per_reticle_x,
             dies_per_reticle_y=config.dies_per_reticle_y,
             fail_die_x=config.reticle_fail_die_x,
             fail_die_y=config.reticle_fail_die_y,
+            fail_rate=getattr(config, "repeater_fail_rate", 1.0),
+            seed=seed,
+        )
+    elif s in ("Striping — Top", "Striping — Bottom",
+               "Striping — Left", "Striping — Right"):
+        edge = s.split("—")[1].strip().lower()
+        return assign_stripe(
+            dies,
+            dies_per_reticle_x=config.dies_per_reticle_x,
+            dies_per_reticle_y=config.dies_per_reticle_y,
+            edge=edge,
+            fail_rate=getattr(config, "stripe_fail_rate", 1.0),
             seed=seed,
         )
     elif s == "Low Yield":
@@ -668,5 +1085,104 @@ def apply_signature(dies: List[Die], signature_type: str,
         return assign_radial_spokes(dies, n_spokes=4, spoke_width=20.0, seed=seed)
     elif s == "Mixed Mode (Edge + Center)":
         return assign_mixed_mode(dies, radius, ee, seed=seed)
+
+    # ----- Scratch families (bins 26-29) --------------------------------
+    # For the three "lot_repeatable" families we draw the geometry from
+    # `lot_rng` (fixed across the lot) but pass the per-wafer `seed` for the
+    # fail_rate speckle. For the wand scratch, everything comes from `seed`.
+    elif s == "Robotic Handler Scratch":
+        # One fixed angle + sideways offset for the whole lot.
+        angle = lot_rng.uniform(0.0, 180.0)
+        offset = lot_rng.uniform(-radius * 0.3, radius * 0.3)
+        return assign_handler_scratch(
+            dies, angle_deg=angle, offset_mm=offset,
+            width_mm=max(config.die_width, config.die_height) * 1.2, seed=seed)
+    elif s == "Cassette Slot Scratch":
+        # One fixed side (angle) of the wafer for the whole lot.
+        angle = lot_rng.uniform(0.0, 360.0)
+        return assign_slot_scratch(
+            dies, radius, ee, angle_deg=angle,
+            depth_mm=radius * 0.18, arc_span_deg=45.0, seed=seed)
+    elif s == "Wafer-Wand Scratch":
+        # Fully per-wafer: angle, position, wiggle and presence all use `seed`.
+        return assign_wand_scratch(
+            dies, radius,
+            width_mm=max(config.die_width, config.die_height) * 1.1, seed=seed)
+    elif s == "CMP Arc Scratch":
+        # Fixed pad-sweep radius + arc center + start angle for the whole lot.
+        arc_radius = radius * lot_rng.uniform(0.7, 1.0)
+        center_off = radius * lot_rng.uniform(0.5, 0.9)
+        start_ang = lot_rng.uniform(0.0, 2 * np.pi)
+        return assign_cmp_arc_scratch(
+            dies, radius, arc_radius=arc_radius, arc_width=radius * 0.10,
+            center_offset=(center_off, 0.0), angle_start=start_ang,
+            arc_span_deg=140.0, seed=seed)
+
     else:
         return assign_random_scatter(dies, seed=seed)
+
+
+# ---------------------------------------------------------------------------
+# Multi-signature compositor
+# ---------------------------------------------------------------------------
+
+def compose_signatures(dies: List[Die], signature_types: List[str],
+                       config: WaferConfig, seed: int = None,
+                       lot_seed: int = None) -> List[DieResult]:
+    """Overlay several signatures on ONE wafer and merge them per die.
+
+    Why this exists
+    ---------------
+    Real wafers often show more than one failure signature at once (e.g. an
+    edge ring from a process problem AND a scratch from a handling problem),
+    because the root causes are unrelated. This function lets us stack any
+    number of the existing signatures on a single wafer.
+
+    How it works
+    ------------
+    1. Run each requested signature independently via apply_signature(). Each
+       returns a full list of per-die results in the SAME die order.
+    2. Walk the dies position-by-position and decide a single final bin:
+         - If NO signature failed a die, it stays PASS.
+         - If one or more signatures failed it, the EARLIER signature in the
+           list wins (it has higher priority). So order matters: put the most
+           important / most visually dominant signature first.
+
+    This needs zero changes to the individual assign_* functions — it purely
+    combines their outputs, so every one of the existing signatures (including
+    the new scratch families) can be layered for free.
+
+    Parameters
+    ----------
+    signature_types : ordered list of signature names. Index 0 = highest
+                      priority (wins ties on a shared die).
+    seed, lot_seed  : forwarded to each apply_signature call (see that function).
+    """
+    # Degenerate cases: nothing selected -> all pass; one selected -> just it.
+    if not signature_types:
+        return [_pass(die) for die in dies]
+    if len(signature_types) == 1:
+        return apply_signature(dies, signature_types[0], config,
+                               seed=seed, lot_seed=lot_seed)
+
+    # Step 1: generate every layer. We nudge each layer's per-wafer seed by its
+    # index so two layers don't produce identical random speckle, while staying
+    # fully reproducible for a given (seed, lot_seed).
+    layers = []
+    for i, name in enumerate(signature_types):
+        layer_seed = None if seed is None else seed + i * 101
+        layers.append(apply_signature(dies, name, config,
+                                      seed=layer_seed, lot_seed=lot_seed))
+
+    # Step 2: merge per die. Because every layer preserves die order, we can
+    # simply zip them together index-by-index.
+    merged: List[DieResult] = []
+    for die_idx, die in enumerate(dies):
+        final_bin = 1  # assume PASS until some layer says otherwise
+        for layer in layers:
+            bin_num = layer[die_idx][4]  # the 5th field is the bin number
+            if bin_num != 1:  # this layer failed the die
+                final_bin = bin_num
+                break  # earliest (highest-priority) failing layer wins
+        merged.append((*die, final_bin))
+    return merged

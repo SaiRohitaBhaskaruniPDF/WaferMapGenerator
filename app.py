@@ -2,8 +2,14 @@
 Wafer Map Bot — Streamlit Web App
 LLM-driven chatbot that generates synthetic wafer maps for pre-sales demos.
 
-Primary view: conversational chat with inline maps and downloads.
-Sidebar: Azure settings, manual configuration, clear conversation.
+Two ways in, one pipeline out:
+  * Chat page   — natural language -> llm_agent.parse_user_request()
+  * Manual page — a form that fills the same WaferGenRequest directly
+
+Both paths call generator.generate(), which runs the full spec pipeline
+(signature -> yield model -> CP cascade -> bin mapping -> multi-site) and
+returns a GenerationResult that this file renders and offers for download
+(CSV, per-test CSV, PNG/SVG/JPEG/TIFF maps, STDF per lot per insertion).
 """
 from __future__ import annotations
 
@@ -39,19 +45,32 @@ def _inject_streamlit_secrets() -> None:
 
 _inject_streamlit_secrets()
 
-from geometry import WaferConfig, compute_die_grid
+from geometry import (
+    STANDARD_DIAMETERS, auto_edge_type, validate_die_size,
+    EDGE_EXCLUSION_MIN, EDGE_EXCLUSION_MAX,
+    STREET_MIN, STREET_MAX, STREET_DEFAULT,
+)
 from renderer import render_wafermaps, figure_to_bytes, IMAGE_FORMATS
-from signatures import SIGNATURE_NAMES, BIN_DEFINITIONS, apply_signature
-from llm_agent import parse_user_request, WaferGenRequest, request_to_config, MAX_WAFERS
-from stdf_writer import write_stdf
+from signatures import SIGNATURE_NAMES, BIN_DEFINITIONS, SCRATCH_FAMILIES
+from llm_agent import (
+    parse_user_request, WaferGenRequest, request_to_config,
+    MAX_WAFERS, LOT_SIZE_PRESETS,
+)
+from binning import HARDBIN_CHOICES, SOFTBIN_MULTIPLIERS
+from test_items import (
+    TEST_COUNT_CHOICES, NAMING_STYLES, VERBOSE_LENGTHS, VALUE_SHAPES,
+    estimate_result_count,
+)
+from fab import LOT_CADENCES, SITE_PATTERNS
+from generator import generate, GenerationResult
 
 EXAMPLE_PROMPTS = [
     "Give me 6 wafers on a 300 mm wafer with edge ring failures — lot ID DEMO_A01",
-    "5 wafers showing center cluster defects, 8×8 mm dies, 200 mm wafer",
-    "Generate 4 wafers with a reticle-systematic pattern for product HBN_PRD020",
-    "I need 8 wafers showing a low-yield scenario with scratches — 10×15 mm dies",
-    "Create 3 wafers with mixed edge ring and center cluster failures",
-    "Show me a bull's-eye pattern on 10 wafers with 5 mm dies",
+    "5 wafers with center cluster defects at 92% yield, 8×8 mm dies, 200 mm wafer",
+    "Full lot with a soft repeater pattern, CP1 and CP2 insertions",
+    "8 wafers with striping on the top of each reticle field — lens tilt demo",
+    "4 lots per week of edge ring wafers with defect density 0.4 per cm2",
+    "Show me a bull's-eye pattern on 10 wafers with 5 mm dies and a bad probe site",
 ]
 
 _SIG_BIN = {
@@ -68,6 +87,11 @@ _SIG_BIN = {
     "Diagonal Scratch": 21, "Concentric Rings": 22,
     "Peripheral Spot": 23, "Radial Spokes": 24,
     "Mixed Mode (Edge + Center)": 25,
+    "Striping — Top": 30, "Striping — Bottom": 30,
+    "Striping — Left": 30, "Striping — Right": 30,
+    # Scratch families (bins 26-29), pulled straight from SCRATCH_FAMILIES so
+    # the bin numbers can never drift out of sync with signatures.py.
+    **{name: info["bin"] for name, info in SCRATCH_FAMILIES.items()},
 }
 
 
@@ -91,31 +115,8 @@ def _init_session_state() -> None:
         st.session_state["page"] = "chat"
 
 
-def _build_df(all_wafers, titles, lot_id, program):
-    """Build the master CSV DataFrame from generated wafers."""
-    rows = []
-    now_str = datetime.now().strftime("%m/%d/%Y %H:%M")
-    for w_idx, (wafer, title) in enumerate(zip(all_wafers, titles)):
-        for dieX, dieY, cx, cy, bin_num in wafer:
-            info = BIN_DEFINITIONS.get(bin_num, {})
-            rows.append({
-                "Program":     program,
-                "Lot":         lot_id,
-                "Wafer":       title,
-                "WaferNumber": w_idx + 1,
-                "start_time":  now_str,
-                "rework_flag": 0,
-                "Bin":         bin_num,
-                "dieX":        dieX,
-                "dieY":        dieY,
-                "BinName":     info.get("name", f"HARDBIN{bin_num}"),
-                "BinState":    info.get("state", "F"),
-                "BinDesc":     info.get("description", ""),
-            })
-    return pd.DataFrame(rows)
-
-
 def _compute_yields(all_wafers):
+    """Per-wafer yield % from internal-bin die results."""
     yields = []
     for wafer in all_wafers:
         total = len(wafer)
@@ -124,36 +125,23 @@ def _compute_yields(all_wafers):
     return yields
 
 
-def _generate_wafers(config, signature, num_wafers, lot_id, program):
-    dies = compute_die_grid(config)
-    all_wafers, titles = [], []
-    for w in range(num_wafers):
-        seed = w * 137 + hash(signature) % 10000
-        all_wafers.append(apply_signature(dies, signature, config, seed=seed))
-        titles.append(f"{lot_id}_{w + 1:02d}")
-    df = _build_df(all_wafers, titles, lot_id, program)
-    return all_wafers, titles, df
-
-
-def _config_summary(config: WaferConfig, sig_name: str = "") -> str:
+def _config_summary(result: GenerationResult, sig_name: str = "") -> str:
     """Short human-readable config line for captions and chat replies."""
+    config = result.config
     parts = [
         f"{int(config.diameter)} mm",
         f"{config.die_width}×{config.die_height} mm dies",
-        (f"notch {config.notch_orientation}" if config.edge_type == "notch" else "flat"),
+        (f"notch {config.edge_orientation}" if config.edge_type == "notch"
+         else f"flat {config.edge_orientation}"),
+        f"{config.street_width * 1000:.0f} µm street",
+        f"reticle {config.dies_per_reticle_x}×{config.dies_per_reticle_y}",
     ]
-    if config.street_width > 0:
-        if config.street_width < 0.1:
-            parts.append(f"{config.street_width * 1000:.0f} µm street")
-        else:
-            parts.append(f"{config.street_width} mm street")
-    if sig_name == "Reticle Pattern" or (
-        config.dies_per_reticle_x != 2 or config.dies_per_reticle_y != 2
-    ):
-        parts.append(
-            f"reticle {config.dies_per_reticle_x}×{config.dies_per_reticle_y} "
-            f"({config.reticle_width_mm:.1f}×{config.reticle_height_mm:.1f} mm)"
-        )
+    if len(result.insertion_names) > 1:
+        parts.append(" + ".join(result.insertion_names))
+    if result.site_count > 1:
+        parts.append(f"{result.site_count} sites")
+    if len(result.lots) > 1:
+        parts.append(f"{len(result.lots)} lots")
     return " · ".join(parts)
 
 
@@ -169,13 +157,34 @@ def _build_zip_bytes(all_wafers, titles, config, fmt: str) -> bytes:
     return zip_buf.getvalue()
 
 
-def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix, precomputed=None):
-    """Compact download row for chat or manual results.
+def _stdf_download_bytes(result: GenerationResult) -> tuple[bytes, str]:
+    """STDF export: a single .stdf when there is exactly one file, otherwise
+    a ZIP holding one STDF per lot per insertion (a real sort run produces
+    one file per insertion)."""
+    files = result.stdf_files()
+    if len(files) == 1:
+        name, data = next(iter(files.items()))
+        return data, name
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files.items():
+            zf.writestr(name, data)
+    zip_buf.seek(0)
+    return zip_buf.getvalue(), f"{result.primary_lot.lot_id}_stdf.zip"
 
-    Uses a per-entry, per-format session-state cache so that images and ZIPs are
-    never recomputed on Streamlit re-renders — only when a new image format is
-    selected for the first time.
+
+def _render_downloads(result: GenerationResult, key_prefix: str, precomputed=None):
+    """Compact download rows for chat or manual results.
+
+    Uses a per-entry, per-format session-state cache so images and ZIPs are
+    never recomputed on Streamlit re-renders — only when a new image format
+    is selected for the first time.
     """
+    lot = result.primary_lot
+    cp1_wafers = lot.insertion_wafers("CP1")
+    titles = lot.wafer_ids
+    config = result.config
+
     img_fmt = st.selectbox(
         "Image format",
         IMAGE_FORMATS,
@@ -183,39 +192,38 @@ def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix, precom
         key=f"{key_prefix}_img_fmt",
     )
 
-    # One cache dict per chat/manual entry, persists across re-renders
     cache_key = f"_dl_cache_{key_prefix}"
     if cache_key not in st.session_state:
-        # Seed with any bytes already computed during generation
         st.session_state[cache_key] = dict(precomputed) if precomputed else {}
     cache = st.session_state[cache_key]
 
-    # Ensure CSV and STDF are cached (format-agnostic)
+    # Format-agnostic exports (CSV / per-test CSV / STDF), cached once.
     if "csv" not in cache:
-        cache["csv"] = df.to_csv(index=False).encode("utf-8")
+        cache["csv"] = result.df.to_csv(index=False).encode("utf-8")
     if "stdf" not in cache:
-        program = df["Program"].iloc[0] if not df.empty else "DEMO"
-        cache["stdf"] = write_stdf(lot_id, program, titles, all_wafers)
+        with st.spinner("Building STDF…"):
+            cache["stdf"], cache["stdf_name"] = _stdf_download_bytes(result)
+    if "param_csv" not in cache and result.param_df is not None:
+        cache["param_csv"] = result.param_df.to_csv(index=False).encode("utf-8")
 
-    # Ensure grid bytes for the selected format are cached
+    # Image grid + per-wafer ZIP for the selected format (first lot, CP1).
     fmt_cache = cache.get(img_fmt, {})
     if "grid" not in fmt_cache:
         with st.spinner(f"Rendering {img_fmt.upper()} grid…"):
-            fig_grid = render_wafermaps(all_wafers, config, titles=titles)
+            fig_grid = render_wafermaps(cp1_wafers, config, titles=titles)
             fmt_cache["grid"] = figure_to_bytes(fig_grid, fmt=img_fmt)
             plt.close(fig_grid)
         cache[img_fmt] = fmt_cache
-
-    # Ensure ZIP bytes for the selected format are cached (deferred until needed)
     if "zip" not in fmt_cache:
-        with st.spinner(f"Building {img_fmt.upper()} ZIP ({len(all_wafers)} wafers)…"):
-            fmt_cache["zip"] = _build_zip_bytes(all_wafers, titles, config, fmt=img_fmt)
+        with st.spinner(f"Building {img_fmt.upper()} ZIP ({len(cp1_wafers)} wafers)…"):
+            fmt_cache["zip"] = _build_zip_bytes(cp1_wafers, titles, config, fmt=img_fmt)
         cache[img_fmt] = fmt_cache
 
+    lot_id = lot.lot_id
     r1c1, r1c2 = st.columns(2)
     with r1c1:
         st.download_button(
-            "CSV",
+            "CSV (die level)",
             data=cache["csv"],
             file_name=f"{lot_id}_wafer_data.csv",
             mime="text/csv",
@@ -224,9 +232,9 @@ def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix, precom
         )
     with r1c2:
         st.download_button(
-            "STDF",
+            "STDF" if cache["stdf_name"].endswith(".stdf") else "STDF (ZIP per insertion)",
             data=cache["stdf"],
-            file_name=f"{lot_id}_wafer_data.stdf",
+            file_name=cache["stdf_name"],
             mime="application/octet-stream",
             use_container_width=True,
             key=f"{key_prefix}_stdf",
@@ -252,42 +260,107 @@ def _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix, precom
             key=f"{key_prefix}_zip",
         )
 
+    if "param_csv" in cache:
+        st.download_button(
+            "CSV (per-test results, CP1)",
+            data=cache["param_csv"],
+            file_name=f"{lot_id}_test_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"{key_prefix}_param_csv",
+        )
 
-def _render_chat_result(all_wafers, config, titles, df, lot_id, sig_name, key_prefix,
-                        preview_bytes=None, precomputed=None):
-    """Inline wafer maps and downloads inside an assistant chat message."""
-    yields = _compute_yields(all_wafers)
-    total_dies = len(all_wafers[0]) if all_wafers else 0
+
+def _render_result(result: GenerationResult, sig_name: str, key_prefix: str,
+                   preview_bytes=None, precomputed=None):
+    """Inline wafer maps, summaries and downloads for one generation run."""
+    lot = result.primary_lot
+    cp1_wafers = lot.insertion_wafers("CP1")
+    titles = lot.wafer_ids
+    yields = _compute_yields(cp1_wafers)
+    total_dies = len(cp1_wafers[0]) if cp1_wafers else 0
     avg_yield = sum(yields) / len(yields) if yields else 0
 
     st.caption(
-        f"{lot_id} · {sig_name} · {len(all_wafers)} wafers · "
-        f"{total_dies} dies/wafer · {avg_yield:.1f}% avg yield · "
-        f"{_config_summary(config, sig_name)}"
+        f"{lot.lot_id} · {sig_name} · {len(lot.wafers)} wafers · "
+        f"{total_dies} dies/wafer · {avg_yield:.1f}% CP1 avg yield · "
+        f"{_config_summary(result, sig_name)}"
     )
 
+    # CP1 maps of the first lot (the primary preview).
     if preview_bytes:
         st.image(preview_bytes, use_container_width=True)
     else:
-        fig = render_wafermaps(all_wafers, config, titles=titles)
+        fig = render_wafermaps(cp1_wafers, result.config, titles=titles)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
-    _render_downloads(all_wafers, config, titles, df, lot_id, key_prefix, precomputed=precomputed)
+    # Extra insertions: render on demand inside an expander (cheap for CP2/3
+    # because they reuse the same geometry).
+    if len(result.insertion_names) > 1:
+        with st.expander("CP2 / CP3 maps (retest fallout)"):
+            for ins in result.insertion_names[1:]:
+                ins_wafers = lot.insertion_wafers(ins)
+                ins_yields = _compute_yields(ins_wafers)
+                avg = sum(ins_yields) / len(ins_yields) if ins_yields else 0
+                st.markdown(f"**{ins}** — {avg:.1f}% avg yield")
+                fig = render_wafermaps(ins_wafers, result.config,
+                                       titles=[f"{t} {ins}" for t in titles])
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+
+    _render_downloads(result, key_prefix, precomputed=precomputed)
 
     with st.expander("Yield summary & CSV preview"):
+        # Per-wafer, per-insertion yield table.
         summary_rows = []
-        for title, wafer, yld in zip(titles, all_wafers, yields):
-            passed = sum(1 for d in wafer if BIN_DEFINITIONS.get(d[4], {}).get("state") == "P")
-            summary_rows.append({
-                "Wafer ID": title,
-                "Total Dies": len(wafer),
-                "Pass": passed,
-                "Fail": len(wafer) - passed,
-                "Yield (%)": round(yld, 2),
-            })
+        for wafer in lot.wafers:
+            row = {"Wafer ID": wafer.wafer_id, "Total Dies": total_dies}
+            for ins in result.insertion_names:
+                results = wafer.insertions[ins]
+                passed = sum(1 for d in results
+                             if BIN_DEFINITIONS.get(d[4], {}).get("state") == "P")
+                row[f"{ins} Yield (%)"] = round(passed / len(results) * 100, 2)
+            summary_rows.append(row)
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-        st.dataframe(df.head(100), use_container_width=True, hide_index=True)
+
+        if result.s2s is not None:
+            st.caption(
+                "S2S factors per site: "
+                + ", ".join(f"site {i + 1}: {f:.2f}" for i, f in enumerate(result.s2s))
+            )
+        if len(result.lots) > 1:
+            lots_df = pd.DataFrame([
+                {"Lot": l.lot_id,
+                 "Sort start": l.start_time.strftime("%Y-%m-%d %H:%M"),
+                 "Wafers": len(l.wafers)}
+                for l in result.lots
+            ])
+            st.dataframe(lots_df, use_container_width=True, hide_index=True)
+
+        st.dataframe(result.df.head(100), use_container_width=True, hide_index=True)
+
+
+def _run_generation(req: WaferGenRequest) -> dict:
+    """Shared chat/manual path: request -> config -> pipeline -> result dict."""
+    config = request_to_config(req)
+    result = generate(req, config)
+
+    lot = result.primary_lot
+    preview_fig = render_wafermaps(lot.insertion_wafers("CP1"), result.config,
+                                   titles=lot.wafer_ids)
+    preview_bytes = figure_to_bytes(preview_fig, fmt="png")
+    plt.close(preview_fig)
+
+    # Seed the download cache with what we already rendered (zero extra cost).
+    precomputed = {"png": {"grid": preview_bytes}}
+
+    return {
+        "result": result,
+        "preview_bytes": preview_bytes,
+        "precomputed": precomputed,
+        "sig": " + ".join(req.signatures),
+    }
 
 
 def _process_chat_request(user_input: str) -> dict:
@@ -311,47 +384,17 @@ def _process_chat_request(user_input: str) -> dict:
         azure_deployment=azure_deployment,
     )
 
-    config = request_to_config(req)
-
-    all_wafers, titles, df = _generate_wafers(
-        config, req.signature, req.num_wafers, req.lot_id, req.program,
-    )
-
-    preview_fig = render_wafermaps(all_wafers, config, titles=titles)
-    preview_bytes = figure_to_bytes(preview_fig, fmt="png")
-    plt.close(preview_fig)
-
-    # Pre-compute format-agnostic bytes and seed the PNG grid cache with the
-    # preview render (already done above — zero extra cost).
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    stdf_bytes = write_stdf(req.lot_id, req.program, titles, all_wafers)
-    precomputed = {
-        "png": {"grid": preview_bytes},  # ZIP deferred until user requests it
-        "csv": csv_bytes,
-        "stdf": stdf_bytes,
-    }
+    payload = _run_generation(req)
 
     method = "Azure GPT" if req.used_llm else "keyword parser"
     content = (
         f"{req.explanation}\n\n"
-        f"*{method}* · **{req.signature}** · {req.num_wafers} wafers · "
-        f"Lot {req.lot_id} · {_config_summary(config, req.signature)}"
+        f"*{method}* · **{payload['sig']}** · {req.num_wafers} wafers · "
+        f"Lot {payload['result'].primary_lot.lot_id} · "
+        f"{_config_summary(payload['result'], payload['sig'])}"
     )
 
-    return {
-        "role": "assistant",
-        "content": content,
-        "result": {
-            "all_wafers": all_wafers,
-            "config": config,
-            "titles": titles,
-            "df": df,
-            "lot_id": req.lot_id,
-            "sig": req.signature,
-            "preview_bytes": preview_bytes,
-            "precomputed": precomputed,
-        },
-    }
+    return {"role": "assistant", "content": content, "payload": payload}
 
 
 def _handle_user_message(user_input: str) -> None:
@@ -363,16 +406,22 @@ def _handle_user_message(user_input: str) -> None:
 
 
 def _render_signature_help() -> None:
-    with st.expander("What can I ask for? (29 spatial signatures)"):
+    with st.expander(f"What can I ask for? ({len(SIGNATURE_NAMES)} spatial signatures)"):
         st.caption(
             "Describe any pattern in plain English — e.g. \"edge ring failures\", "
-            "\"scratches\", \"reticle pattern\". You can also specify street width "
-            "(e.g. \"0.1 mm street\") and reticle layout (e.g. \"3×3 reticle\")."
+            "\"soft repeaters\", \"striping\". Combine several (\"edge ring and a "
+            "scratch\") to layer them. You can also specify yield (\"92% yield\" or "
+            "\"0.5 defects/cm2\"), insertions (\"CP1 and CP2\"), lot sequences "
+            "(\"4 lots per week\"), street width, test time, and more."
         )
         for name in SIGNATURE_NAMES:
             bn = _SIG_BIN.get(name, 5)
             info = BIN_DEFINITIONS.get(bn, {})
-            st.markdown(f"**{name}** — {info.get('description', '')}")
+            line = f"**{name}** — {info.get('description', '')}"
+            fam = SCRATCH_FAMILIES.get(name)
+            if fam:
+                line += f"  \n_Tool:_ {fam['tool']}. _Root cause:_ {fam['root_cause']}."
+            st.markdown(line)
 
 
 def _render_sidebar() -> None:
@@ -467,13 +516,12 @@ def _render_chat_page() -> None:
         role = "user" if msg["role"] == "user" else "assistant"
         with st.chat_message(role):
             st.markdown(msg["content"])
-            if msg.get("result"):
-                r = msg["result"]
-                _render_chat_result(
-                    r["all_wafers"], r["config"], r["titles"], r["df"],
-                    r["lot_id"], r["sig"], key_prefix=f"chat_{idx}",
-                    preview_bytes=r.get("preview_bytes"),
-                    precomputed=r.get("precomputed"),
+            if msg.get("payload"):
+                p = msg["payload"]
+                _render_result(
+                    p["result"], p["sig"], key_prefix=f"chat_{idx}",
+                    preview_bytes=p.get("preview_bytes"),
+                    precomputed=p.get("precomputed"),
                 )
 
     if not st.session_state["chat_history"]:
@@ -490,106 +538,262 @@ def _render_manual_page() -> None:
     st.caption("Set parameters directly without the chatbot. Results appear below after you generate.")
 
     with st.form("manual_form"):
+        # ---- Geometry (spec must-haves) --------------------------------------
         c1, c2 = st.columns(2)
         with c1:
-            diameter = st.number_input("Wafer diameter (mm)", 50.0, 450.0, 300.0, 1.0)
-            edge_type = st.radio("Edge type", ["notch", "flat"], horizontal=True)
-            notch_orientation = st.radio(
-                "Notch orientation",
+            diameter = st.selectbox(
+                "Wafer diameter (mm)", [int(d) for d in STANDARD_DIAMETERS],
+                index=2,
+                help="Spec sizes only. 150 mm wafers get a FLAT, 200/300 mm a NOTCH.",
+            )
+            edge_orientation = st.radio(
+                "Notch/flat orientation",
                 ["down", "up", "left", "right"],
                 horizontal=True,
-                disabled=(edge_type == "flat"),
-                help="Which direction the notch points (ignored for flat edge)",
+                help="Which side of the map the edge marker sits on (90° steps).",
             )
-            edge_exclusion = st.slider("Edge exclusion (mm)", 1.0, 5.0, 3.0, 0.5)
-            signature_type = st.selectbox("Signature", SIGNATURE_NAMES)
+            edge_exclusion = st.slider(
+                "Edge exclusion (mm)",
+                EDGE_EXCLUSION_MIN, EDGE_EXCLUSION_MAX, 3.0, 0.5,
+            )
+            signature_types = st.multiselect(
+                "Signature(s)", SIGNATURE_NAMES, default=["Edge Ring"],
+                help="Pick one, or several to layer them (e.g. Edge Ring + a scratch).",
+            )
         with c2:
-            die_width = st.number_input("Die width (mm)", 1.0, 30.0, 10.0, 0.5)
-            die_height = st.number_input("Die height (mm)", 1.0, 30.0, 10.0, 0.5)
-            street_width = st.number_input("Street width (mm)", 0.0, 5.0, 0.0, 0.05)
+            die_width = st.number_input(
+                "Die width (mm)", 1.0, 35.0, 10.0, 0.5,
+                help="1–25/35 mm; aspect ratio must stay between 1:2 and 2:1.",
+            )
+            die_height = st.number_input("Die height (mm)", 1.0, 35.0, 10.0, 0.5)
+            street_width = st.number_input(
+                "Street width (mm)", STREET_MIN, STREET_MAX, STREET_DEFAULT, 0.05,
+                help="Scribe street between dies: 0.05–0.2 mm (spec).",
+            )
             lot_id = st.text_input("Lot ID", "LOT_001")
             program = st.text_input("Program", "HBN_PRD020")
-            num_wafers = st.slider("Number of wafers", 1, MAX_WAFERS, 4)
+            lot_preset = st.selectbox(
+                "Lot size", list(LOT_SIZE_PRESETS.keys()), index=0,
+                help="Wafers ship in FOUP carriers: 25 standard, 13 thin/bonded. "
+                     "Choose 'Partial Lot' to set a custom count.",
+            )
+            custom_wafers = st.slider(
+                "Custom wafer count (used for 'Partial Lot')", 1, MAX_WAFERS, 4,
+            )
+            preset_value = LOT_SIZE_PRESETS[lot_preset]
+            num_wafers = preset_value if preset_value is not None else custom_wafers
 
-        with st.expander("Grid offset"):
-            x_offset = st.number_input("X offset (mm)", -10.0, 10.0, 0.0, 0.5)
-            y_offset = st.number_input("Y offset (mm)", -10.0, 10.0, 0.0, 0.5)
+        # ---- Yield model ---------------------------------------------------
+        with st.expander("Yield model"):
+            yield_mode = st.radio(
+                "Yield input", ["signature", "direct", "defect_density"],
+                horizontal=True,
+                format_func={"signature": "From signature",
+                             "direct": "Direct yield %",
+                             "defect_density": "Defect density"}.get,
+                help="Direct: set wafer yield. Defect density: Y = e^(-A·D) with "
+                     "A = die area in cm². Signature: whatever the pattern gives.",
+            )
+            target_yield_pct = st.slider("Target yield (%)", 0.0, 100.0, 90.0, 0.5)
+            defect_density = st.number_input(
+                "Defect density (defects/cm²)", 0.0, 20.0, 0.5, 0.05,
+            )
 
-        with st.expander("Reticle layout"):
+        # ---- Insertions & bins ------------------------------------------------
+        with st.expander("Test insertions & bins"):
+            num_insertions = st.radio(
+                "Insertions", [1, 2, 3], horizontal=True,
+                format_func=lambda n: ["CP1", "CP1 + CP2", "CP1 + CP2 + CP3"][n - 1],
+                help="CP2/CP3 keep 90–99.9% of the previous insertion's passers; "
+                     "only prior passers can pass a retest.",
+            )
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                hardbin_count = st.selectbox("Hardbins", list(HARDBIN_CHOICES))
+            with bc2:
+                softbin_multiplier = st.selectbox(
+                    "Softbins = hardbins ×", list(SOFTBIN_MULTIPLIERS))
+
+        # ---- Test items ------------------------------------------------------
+        with st.expander("Test items"):
+            test_count = st.selectbox(
+                "Number of test items", list(TEST_COUNT_CHOICES),
+                help="Orders of magnitude only (spec: 100 or 1000, never 307).",
+            )
+            parametric_pct = st.slider(
+                "Parametric share (%)", 0, 100, 50, 10,
+                help="Rest are pass/fail items reporting 0 or 1.",
+            )
+            value_shape = st.selectbox(
+                "Parametric value shape", list(VALUE_SHAPES.keys()),
+                help="uniform: RNG 0–1 · exponential: 10^RNG · quantized: 0.2 "
+                     "steps · signed: -1..+1 · scientific: X.XXe±YY · constant: one value.",
+            )
+            nc1, nc2 = st.columns(2)
+            with nc1:
+                naming_style = st.selectbox(
+                    "Test name style", list(NAMING_STYLES),
+                    help="simple: PARAM_0001 · obnoxious: long names differing only "
+                         "at the end (UI checker) · chunked: gibberish 8-char chunks.",
+                )
+            with nc2:
+                name_length = st.selectbox("Verbose name length", list(VERBOSE_LENGTHS))
+            include_test_data = st.checkbox(
+                "Write per-test results (PTRs in STDF + per-test CSV)",
+                value=False,
+                help="One record per die per test item — files get big fast; "
+                     "a size estimate is checked before generating.",
+            )
+
+        # ---- Timing, multi-site, lots -----------------------------------------
+        with st.expander("Test time, multi-site & lot sequence"):
+            seconds_per_touchdown = st.slider(
+                "Test time (seconds per touchdown)", 1.0, 600.0, 1.0, 1.0,
+                help="Drives per-die test time and wafer start/finish timestamps.",
+            )
+            multi_site = st.checkbox(
+                "Multi-site (parallelism from gross die per wafer)", value=True,
+                help="<200 GDPW: 1 site · 200–399: 2 · 400–799: 4 · 800–1599: 8 · 1600+: 16",
+            )
+            site_pattern = st.selectbox(
+                "Site layout pattern", list(SITE_PATTERNS), index=2,
+            )
+            s2s_enabled = st.checkbox(
+                "Site-to-site yield loss (one weak site)", value=False,
+                help="Healthy setups have all S2S factors > 95%; this drags one "
+                     "random site down so the loss is visible per site.",
+            )
+            st.divider()
+            num_lots = st.number_input(
+                "Number of lots", 1, 60, 1, 1,
+                help="More than 1 generates a time sequence of fab lots "
+                     "(FYYWWSSSS IDs) for trend-chart demos.",
+            )
+            lot_cadence = st.selectbox("Lot cadence", list(LOT_CADENCES.keys()), index=1)
+            auto_lot_id = st.checkbox(
+                "Auto fab lot number (FYYWWSSSS)", value=False,
+                help="Fab letter + year + work week + sequential number, "
+                     "replacing the Lot ID field above.",
+            )
+
+        # ---- Advanced geometry ----------------------------------------------
+        with st.expander("Grid offset & stepping field"):
+            oc1, oc2 = st.columns(2)
+            with oc1:
+                x_offset = st.number_input("X offset (mm)", -10.0, 10.0, 0.0, 0.5)
+            with oc2:
+                y_offset = st.number_input("Y offset (mm)", -10.0, 10.0, 0.0, 0.5)
+            auto_reticle = st.checkbox(
+                "Auto stepping field from die size", value=True,
+                help="Packs as many dies as fit into a 26×33 mm scanner field "
+                     "(spec: the tool must autogenerate the stepping field).",
+            )
             rc1, rc2 = st.columns(2)
             with rc1:
                 dies_per_reticle_x = st.number_input(
-                    "Dies per reticle (X)", 1, 6, 2, 1,
-                )
+                    "Dies per reticle (X, manual)", 1, 10, 2, 1)
                 reticle_fail_die_x = st.number_input(
-                    "Fail die column (0-based)", 0, 5, 0, 1,
-                )
+                    "Repeater die column (0-based)", 0, 9, 0, 1)
             with rc2:
                 dies_per_reticle_y = st.number_input(
-                    "Dies per reticle (Y)", 1, 6, 2, 1,
-                )
+                    "Dies per reticle (Y, manual)", 1, 10, 2, 1)
                 reticle_fail_die_y = st.number_input(
-                    "Fail die row (0-based)", 0, 5, 0, 1,
-                )
-            st.caption(
-                "Reticle layout applies to the Reticle Pattern signature and defines "
-                "field size for systematic stepping."
+                    "Repeater die row (0-based)", 0, 9, 0, 1)
+            repeater_fail_rate = st.slider(
+                "Repeater fail rate (%)", 10, 100, 100, 10,
+                help="100% = hard repeater (always fails). Lower = soft repeater.",
+            )
+            stripe_fail_rate = st.slider(
+                "Striping fail rate (%)", 10, 100, 100, 10,
+                help="Hardness of the Striping signatures (lens-tilt stripes).",
             )
 
         generate_btn = st.form_submit_button("Generate", type="primary", use_container_width=True)
 
     if generate_btn:
-        dpr_x = int(dies_per_reticle_x)
-        dpr_y = int(dies_per_reticle_y)
-        config = WaferConfig(
+        # Guard against an empty multiselect — fall back to a sensible default.
+        if not signature_types:
+            signature_types = ["Edge Ring"]
+
+        # Spec validation: die aspect ratio must stay between 1:2 and 2:1.
+        ok, msg = validate_die_size(die_width, die_height)
+        if not ok:
+            st.error(msg)
+            return
+
+        # Size guardrail before generating per-test data.
+        if include_test_data:
+            # Rough GDPW estimate: usable area / die area.
+            import math
+            usable_r = diameter / 2 - edge_exclusion
+            est_dies = int(math.pi * usable_r ** 2 / (die_width * die_height))
+            est_records = estimate_result_count(test_count, est_dies,
+                                                num_wafers * int(num_lots))
+            if est_records > 5_000_000:
+                st.error(
+                    f"Per-test export would contain ~{est_records:,} records. "
+                    "Reduce the test count, wafer count or lots (cap: 5,000,000)."
+                )
+                return
+            if est_records > 1_000_000:
+                st.warning(f"Large export: ~{est_records:,} per-test records.")
+
+        req = WaferGenRequest(
             diameter=float(diameter),
-            edge_type=edge_type,
+            edge_type=auto_edge_type(float(diameter)),
             edge_exclusion=float(edge_exclusion),
             die_width=float(die_width),
             die_height=float(die_height),
             x_offset=float(x_offset),
             y_offset=float(y_offset),
             street_width=float(street_width),
-            dies_per_reticle_x=dpr_x,
-            dies_per_reticle_y=dpr_y,
-            reticle_fail_die_x=int(reticle_fail_die_x) % dpr_x,
-            reticle_fail_die_y=int(reticle_fail_die_y) % dpr_y,
-            notch_orientation=notch_orientation if edge_type == "notch" else "down",
+            edge_orientation=edge_orientation,
+            auto_reticle=bool(auto_reticle),
+            dies_per_reticle_x=int(dies_per_reticle_x),
+            dies_per_reticle_y=int(dies_per_reticle_y),
+            reticle_fail_die_x=int(reticle_fail_die_x),
+            reticle_fail_die_y=int(reticle_fail_die_y),
+            repeater_fail_rate=repeater_fail_rate / 100.0,
+            stripe_fail_rate=stripe_fail_rate / 100.0,
+            lot_id=lot_id,
+            program=program,
+            num_wafers=int(num_wafers),
+            num_lots=int(num_lots),
+            lot_cadence=lot_cadence,
+            auto_lot_id=bool(auto_lot_id),
+            yield_mode=yield_mode,
+            target_yield_pct=float(target_yield_pct),
+            defect_density=float(defect_density),
+            num_insertions=int(num_insertions),
+            hardbin_count=int(hardbin_count),
+            softbin_multiplier=int(softbin_multiplier),
+            test_count=int(test_count),
+            parametric_pct=int(parametric_pct),
+            value_shape=value_shape,
+            naming_style=naming_style,
+            name_length=int(name_length),
+            include_test_data=bool(include_test_data),
+            seconds_per_touchdown=float(seconds_per_touchdown),
+            multi_site=bool(multi_site),
+            site_pattern=site_pattern,
+            s2s_enabled=bool(s2s_enabled),
+            s2s_healthy=not bool(s2s_enabled),
+            signatures=signature_types,
         )
+
         with st.spinner("Generating…"):
-            all_wafers, titles, df = _generate_wafers(
-                config, signature_type, num_wafers, lot_id, program,
-            )
-            preview_fig = render_wafermaps(all_wafers, config, titles=titles)
-            preview_bytes = figure_to_bytes(preview_fig, fmt="png")
-            plt.close(preview_fig)
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            stdf_bytes = write_stdf(lot_id, program, titles, all_wafers)
-        st.session_state["manual_result"] = {
-            "all_wafers": all_wafers,
-            "config": config,
-            "titles": titles,
-            "df": df,
-            "lot_id": lot_id,
-            "sig": signature_type,
-            "preview_bytes": preview_bytes,
-            "precomputed": {
-                "png": {"grid": preview_bytes},
-                "csv": csv_bytes,
-                "stdf": stdf_bytes,
-            },
-        }
+            payload = _run_generation(req)
+        st.session_state["manual_result"] = payload
         # Clear any stale download cache for this entry
         st.session_state.pop("_dl_cache_manual", None)
 
     if "manual_result" in st.session_state:
-        r = st.session_state["manual_result"]
+        p = st.session_state["manual_result"]
         st.divider()
-        _render_chat_result(
-            r["all_wafers"], r["config"], r["titles"], r["df"],
-            r["lot_id"], r["sig"], key_prefix="manual",
-            preview_bytes=r.get("preview_bytes"),
-            precomputed=r.get("precomputed"),
+        _render_result(
+            p["result"], p["sig"], key_prefix="manual",
+            preview_bytes=p.get("preview_bytes"),
+            precomputed=p.get("precomputed"),
         )
 
 
