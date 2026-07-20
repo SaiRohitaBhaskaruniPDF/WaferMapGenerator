@@ -133,6 +133,7 @@ def _config_summary(result: GenerationResult, sig_name: str = "") -> str:
         f"{config.die_width}×{config.die_height} mm dies",
         (f"notch {config.edge_orientation}" if config.edge_type == "notch"
          else f"flat {config.edge_orientation}"),
+        f"{config.edge_exclusion:g} mm edge excl",
         f"{config.street_width * 1000:.0f} µm street",
         f"reticle {config.dies_per_reticle_x}×{config.dies_per_reticle_y}",
     ]
@@ -205,6 +206,16 @@ def _render_downloads(result: GenerationResult, key_prefix: str, precomputed=Non
             cache["stdf"], cache["stdf_name"] = _stdf_download_bytes(result)
     if "param_csv" not in cache and result.param_df is not None:
         cache["param_csv"] = result.param_df.to_csv(index=False).encode("utf-8")
+    if "ft_csv" not in cache and result.ft_df is not None:
+        cache["ft_csv"] = result.ft_df.to_csv(index=False).encode("utf-8")
+    if "match_csv" not in cache and result.match_df is not None:
+        cache["match_csv"] = result.match_df.to_csv(index=False).encode("utf-8")
+    if "manifest_json" not in cache and result.story_manifest is not None:
+        import json
+        cache["manifest_json"] = json.dumps(
+            result.story_manifest, indent=2).encode("utf-8")
+    if "multidie_csv" not in cache and result.multidie_df is not None:
+        cache["multidie_csv"] = result.multidie_df.to_csv(index=False).encode("utf-8")
 
     # Image grid + per-wafer ZIP for the selected format (first lot, CP1).
     fmt_cache = cache.get(img_fmt, {})
@@ -269,6 +280,60 @@ def _render_downloads(result: GenerationResult, key_prefix: str, precomputed=Non
             use_container_width=True,
             key=f"{key_prefix}_param_csv",
         )
+
+    if "ft_csv" in cache or "match_csv" in cache:
+        st.markdown("**Story 1 — FT / traceability**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if "ft_csv" in cache:
+                st.download_button(
+                    "CSV (Final Test units)",
+                    data=cache["ft_csv"],
+                    file_name=f"{lot_id}_ft_units.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key=f"{key_prefix}_ft_csv",
+                )
+        with c2:
+            if "match_csv" in cache:
+                st.download_button(
+                    "CSV (match ground truth)",
+                    data=cache["match_csv"],
+                    file_name=f"{lot_id}_ecid_match.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key=f"{key_prefix}_match_csv",
+                )
+        with c3:
+            if "manifest_json" in cache:
+                st.download_button(
+                    "Manifest (JSON)",
+                    data=cache["manifest_json"],
+                    file_name=f"{lot_id}_story1_manifest.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key=f"{key_prefix}_manifest",
+                )
+
+    if "multidie_csv" in cache:
+        st.markdown("**Story 1c — multi-die product traceability**")
+        st.download_button(
+            "CSV (multi-die products)",
+            data=cache["multidie_csv"],
+            file_name=f"{lot_id}_multidie_products.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"{key_prefix}_multidie_csv",
+        )
+        if "manifest_json" in cache:
+            st.download_button(
+                "Manifest (JSON)",
+                data=cache["manifest_json"],
+                file_name=f"{lot_id}_multidie_manifest.json",
+                mime="application/json",
+                use_container_width=True,
+                key=f"{key_prefix}_multidie_manifest",
+            )
 
 
 def _render_result(result: GenerationResult, sig_name: str, key_prefix: str,
@@ -340,6 +405,42 @@ def _render_result(result: GenerationResult, sig_name: str, key_prefix: str,
 
         st.dataframe(result.df.head(100), use_container_width=True, hide_index=True)
 
+    if result.story_summary:
+        story_id = (result.story_manifest or {}).get("story_id", "story1")
+        with st.expander("Story 1 — FT / ECID summary", expanded=True):
+            s = result.story_summary
+            if story_id == "story1_multidie":
+                st.write(
+                    f"Products: {int(s.get('products', 0))} · "
+                    f"FT yield: {s.get('ft_yield_pct', 0):.1f}% · "
+                    f"Fully traceable: {s.get('fully_traceable_pct', 0):.1f}%"
+                )
+            else:
+                st.write(
+                    f"FT units: {int(s.get('ft_units', 0))} · "
+                    f"FT yield: {s.get('ft_yield_pct', 0):.1f}% · "
+                    f"Blank ECID: {s.get('blank_ecid_pct', 0):.2f}% · "
+                    f"Mispick: {s.get('mispick_pct', 0):.1f}%"
+                    + (f" · Spatial hazard (GDBN) units: "
+                       f"{100.0 * s.get('asm_hazard_pct_actual', 0):.1f}% "
+                       f"({int(s.get('asm_hazard_units', 0))} die)"
+                       if story_id == "story1_gdbn" else "")
+                )
+            if result.story_manifest:
+                st.caption(
+                    f"Scenario: {result.story_manifest.get('scenario_id')} · "
+                    f"FT lots: {result.story_manifest.get('ft_lot_ids')} · "
+                    f"GDPW: {result.story_manifest.get('gdpw')}"
+                )
+                if result.story_manifest.get("warnings"):
+                    st.warning(" · ".join(result.story_manifest["warnings"]))
+            if result.ft_df is not None:
+                st.dataframe(result.ft_df.head(50), use_container_width=True,
+                             hide_index=True)
+            if result.multidie_df is not None:
+                st.dataframe(result.multidie_df.head(50), use_container_width=True,
+                             hide_index=True)
+
 
 def _run_generation(req: WaferGenRequest) -> dict:
     """Shared chat/manual path: request -> config -> pipeline -> result dict."""
@@ -382,9 +483,13 @@ def _process_chat_request(user_input: str) -> dict:
         api_key=api_key,
         azure_endpoint=azure_endpoint,
         azure_deployment=azure_deployment,
+        previous_request=st.session_state.get("last_request"),
     )
 
     payload = _run_generation(req)
+    # Remember the request so follow-up messages ("change X, keep the rest")
+    # modify it instead of starting from defaults.
+    st.session_state["last_request"] = req
 
     method = "Azure GPT" if req.used_llm else "keyword parser"
     content = (
@@ -393,6 +498,39 @@ def _process_chat_request(user_input: str) -> dict:
         f"Lot {payload['result'].primary_lot.lot_id} · "
         f"{_config_summary(payload['result'], payload['sig'])}"
     )
+    result = payload["result"]
+    if result.story_summary:
+        s = result.story_summary
+        manifest = result.story_manifest or {}
+        story_id = manifest.get("story_id", "story1")
+        scenario_id = manifest.get("scenario_id")
+        if story_id == "story1_multidie":
+            content += (
+                f"\n\n**Story 1c multi-die ({scenario_id})** — "
+                f"{int(s.get('products', 0))} products · "
+                f"FT yield {s.get('ft_yield_pct', 0):.1f}% · "
+                f"fully traceable {s.get('fully_traceable_pct', 0):.1f}%. "
+                "Download **CSV (multi-die products)** below."
+            )
+        elif story_id == "story1_gdbn":
+            hazard_pct = 100.0 * s.get("asm_hazard_pct_actual", 0)
+            content += (
+                f"\n\n**Story 1g GDBN ({scenario_id})** — "
+                f"{int(s.get('ft_units', 0))} FT units · "
+                f"FT yield {s.get('ft_yield_pct', 0):.1f}% · "
+                f"spatial hazard die {hazard_pct:.1f}% · "
+                f"FT lots {manifest.get('ft_lot_ids')}. "
+                "Download **CSV (Final Test units)** and **CSV (match ground truth)** below."
+            )
+        else:
+            content += (
+                f"\n\n**Story 1 ({scenario_id})** — "
+                f"{int(s.get('ft_units', 0))} FT units · "
+                f"FT yield {s.get('ft_yield_pct', 0):.1f}% · "
+                f"blank ECID {s.get('blank_ecid_pct', 0):.2f}% · "
+                f"FT lots {manifest.get('ft_lot_ids')}. "
+                "Download **CSV (Final Test units)** and **CSV (match ground truth)** below."
+            )
 
     return {"role": "assistant", "content": content, "payload": payload}
 
@@ -436,6 +574,11 @@ def _render_sidebar() -> None:
         if st.button("Manual configuration", use_container_width=True,
                        type="primary" if st.session_state["page"] == "manual" else "secondary"):
             st.session_state["page"] = "manual"
+            st.rerun()
+
+        if st.button("Stories (ECID / FT)", use_container_width=True,
+                       type="primary" if st.session_state["page"] == "stories" else "secondary"):
+            st.session_state["page"] = "stories"
             st.rerun()
 
         st.divider()
@@ -488,6 +631,7 @@ def _render_sidebar() -> None:
 
         if st.button("Clear conversation", use_container_width=True):
             st.session_state["chat_history"] = []
+            st.session_state.pop("last_request", None)
             st.rerun()
 
 
@@ -597,6 +741,12 @@ def _render_manual_page() -> None:
             target_yield_pct = st.slider("Target yield (%)", 0.0, 100.0, 90.0, 0.5)
             defect_density = st.number_input(
                 "Defect density (defects/cm²)", 0.0, 20.0, 0.5, 0.05,
+            )
+            yield_variation_pct = st.slider(
+                "Per-wafer variation (±%)", 0.0, 50.0, 0.0, 5.0,
+                help="Each wafer jitters its defect density (or direct yield "
+                     "target) by a random amount inside this band, so the lot "
+                     "shows realistic wafer-to-wafer yield spread.",
             )
 
         # ---- Insertions & bins ------------------------------------------------
@@ -764,6 +914,7 @@ def _render_manual_page() -> None:
             yield_mode=yield_mode,
             target_yield_pct=float(target_yield_pct),
             defect_density=float(defect_density),
+            yield_variation_pct=float(yield_variation_pct),
             num_insertions=int(num_insertions),
             hardbin_count=int(hardbin_count),
             softbin_multiplier=int(softbin_multiplier),
@@ -797,6 +948,258 @@ def _render_manual_page() -> None:
         )
 
 
+def _render_stories_page() -> None:
+    """Story 1 ECID matching / FT traceability demos."""
+    from assembly import STORY1_SCENARIOS
+    from story1_presets import (
+        SCENARIO_LABELS, GDBN_SCENARIO_LABELS, MULTIDIE_SCENARIO_LABELS,
+        ENCODING_MODE_LABELS, REPRESENTATION_LABELS,
+        apply_scenario_to_request, apply_gdbn_scenario_to_request,
+        apply_multidie_scenario_to_request,
+    )
+
+    st.markdown("## Stories — ECID Matching (Story 1)")
+    st.caption(
+        "Generate CP + Final Test data with ECID traceability scenarios "
+        "from the Yield Stories doc. Downloads include FT units and a "
+        "ground-truth match table (do not join on blank ECID)."
+    )
+
+    family = st.radio(
+        "Story family",
+        ["1:1 / Sweeper / Assembly errors", "Low yield at FT (GDBN)", "Multi-die products"],
+        horizontal=True,
+        help=(
+            "1:1/Sweeper/Assembly errors = spec 1.d-f. "
+            "GDBN = spec 1.g (low yield at FT caused by CP clusters). "
+            "Multi-die = spec 1.c (Case B: multiple die -> one FT product)."
+        ),
+    )
+
+    with st.expander("ECID encoding (spec 1.b)", expanded=False):
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            mode_label = st.selectbox(
+                "ECID value", list(ENCODING_MODE_LABELS.values()), index=0,
+                key="story1_ecid_mode",
+            )
+            ecid_mode = [k for k, v in ENCODING_MODE_LABELS.items() if v == mode_label][0]
+        with ec2:
+            repr_label = st.selectbox(
+                "ECID representation", list(REPRESENTATION_LABELS.values()), index=0,
+                key="story1_ecid_repr",
+            )
+            ecid_representation = [
+                k for k, v in REPRESENTATION_LABELS.items() if v == repr_label][0]
+
+    if family == "Low yield at FT (GDBN)":
+        _render_gdbn_form(GDBN_SCENARIO_LABELS, apply_gdbn_scenario_to_request,
+                          ecid_mode, ecid_representation)
+        return
+    if family == "Multi-die products":
+        _render_multidie_form(MULTIDIE_SCENARIO_LABELS, apply_multidie_scenario_to_request,
+                              ecid_mode, ecid_representation)
+        return
+
+    labels = [SCENARIO_LABELS.get(k, k) for k in STORY1_SCENARIOS]
+    keys = list(STORY1_SCENARIOS.keys())
+
+    with st.form("story1_form"):
+        scenario_label = st.selectbox("Scenario", labels, index=0)
+        scenario_id = keys[labels.index(scenario_label)]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            num_wafers = st.slider("Wafers per CP lot", 1, 25, 5)
+            blank_pct = st.slider(
+                "Blank ECID % (detail / wrecks)", 0.0, 5.0, 1.5, 0.1,
+                help="Assembly wrecks for detail scenarios.",
+            )
+            valid_mix = st.slider(
+                "Mispick valid-ECID mix %", 0.0, 100.0, 50.0, 5.0,
+                help="For wrong-bin / wrong-XY: share keeping a valid ECID.",
+            )
+        with c2:
+            mispick_fail = st.slider(
+                "Mispick FT fail %", 0.0, 100.0, 100.0, 5.0,
+                help="Simple = 100%. Subtle FT default = 80%.",
+            )
+            baseline_ft = st.slider(
+                "Baseline FT fallout % (correct picks)", 0.0, 20.0, 3.0, 0.5,
+            )
+            num_lots = st.number_input(
+                "CP lots (sweeper uses ≥2)", 1, 10, 1, 1,
+            )
+
+        gen = st.form_submit_button(
+            "Generate Story 1 data", type="primary", use_container_width=True,
+        )
+
+    if gen:
+        req = WaferGenRequest(
+            num_wafers=int(num_wafers),
+            num_lots=int(num_lots),
+            signatures=["Edge Ring"],
+            test_count=0,
+            multi_site=False,
+        )
+        apply_scenario_to_request(req, scenario_id)
+        req.ecid_mode = ecid_mode
+        req.ecid_representation = ecid_representation
+        req.blank_ecid_pct = blank_pct / 100.0
+        req.valid_ecid_mix = valid_mix / 100.0
+        req.mispick_ft_fail_pct = mispick_fail / 100.0
+        req.baseline_ft_fallout = baseline_ft / 100.0
+        if scenario_id.endswith("_simple"):
+            req.blank_ecid_pct = 0.0
+        if scenario_id.endswith("_detail"):
+            req.blank_ecid_pct = blank_pct / 100.0
+        if "subtle_ft" in scenario_id and mispick_fail >= 99.0:
+            req.mispick_ft_fail_pct = 0.8
+
+        with st.spinner("Generating Story 1 CP + FT…"):
+            payload = _run_generation(req)
+        st.session_state["stories_result"] = payload
+        st.session_state.pop("_dl_cache_stories", None)
+
+    if "stories_result" in st.session_state:
+        p = st.session_state["stories_result"]
+        st.divider()
+        _render_result(
+            p["result"], p["sig"], key_prefix="stories",
+            preview_bytes=p.get("preview_bytes"),
+            precomputed=p.get("precomputed"),
+        )
+
+
+def _render_gdbn_form(labels: dict, apply_fn, ecid_mode: str, ecid_representation: str) -> None:
+    """Story 1g: low yield at FT caused by CP clusters (GDBN)."""
+    st.caption(
+        "Dramatic = CP is clean, but FT-only fallout traces a spatial pattern "
+        "(default: donut) once mapped back onto CP (X, Y) via ECID. "
+        "Good-die-bad-neighborhood = CP has a real scratch, and passers next "
+        "to it get a default 50% chance of failing FT anyway."
+    )
+    keys = list(labels.keys())
+    display = [labels[k] for k in keys]
+
+    with st.form("story1_gdbn_form"):
+        scenario_label = st.selectbox("GDBN scenario", display, index=0)
+        scenario_id = keys[display.index(scenario_label)]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            num_wafers = st.slider("Wafers per CP lot", 1, 25, 5, key="gdbn_wafers")
+            growth = st.slider(
+                "Neighbourhood growth (dies)", 0, 3, 1, 1,
+                help="Good-die-bad-neighborhood only: dilate the CP fail region "
+                     "by this many dies in every dimension.",
+            )
+        with c2:
+            fail_pct = st.slider(
+                "Spatial hazard FT fail %", 0.0, 100.0, 50.0, 5.0,
+                help="Good-die-bad-neighborhood default = 50%. Dramatic case "
+                     "uses the donut's own fail rate (~87%) regardless of this slider.",
+            )
+            baseline_ft = st.slider(
+                "Baseline FT fallout % (unaffected die)", 0.0, 20.0, 3.0, 0.5,
+                key="gdbn_baseline",
+            )
+
+        gen = st.form_submit_button(
+            "Generate GDBN data", type="primary", use_container_width=True,
+        )
+
+    if gen:
+        req = WaferGenRequest(
+            num_wafers=int(num_wafers),
+            test_count=0,
+            multi_site=False,
+        )
+        apply_fn(req, scenario_id)
+        req.ecid_mode = ecid_mode
+        req.ecid_representation = ecid_representation
+        req.gdbn_growth = int(growth)
+        req.gdbn_fail_pct = fail_pct / 100.0
+        req.baseline_ft_fallout = baseline_ft / 100.0
+
+        with st.spinner("Generating GDBN CP + FT…"):
+            payload = _run_generation(req)
+        st.session_state["stories_result"] = payload
+        st.session_state.pop("_dl_cache_stories", None)
+
+    if "stories_result" in st.session_state:
+        p = st.session_state["stories_result"]
+        st.divider()
+        _render_result(
+            p["result"], p["sig"], key_prefix="stories",
+            preview_bytes=p.get("preview_bytes"),
+            precomputed=p.get("precomputed"),
+        )
+
+
+def _render_multidie_form(labels: dict, apply_fn, ecid_mode: str, ecid_representation: str) -> None:
+    """Story 1c: multi-die product traceability (Case B of the 2x2 matrix)."""
+    from multidie import COMPONENT_ROLES
+
+    st.caption(
+        "Packages 3 known-good die (logic / memory / rf, each a different "
+        "size) into ONE FT product. B.1 = every component traceable back to "
+        "CP. B.2 = the RF component never burns an ECID, so 1 of 3 stays "
+        "permanently untraceable — even on products that pass FT."
+    )
+    st.table(pd.DataFrame(COMPONENT_ROLES).rename(columns={
+        "role": "Component", "die_width": "Die W (mm)", "die_height": "Die H (mm)",
+        "cp_yield": "Nominal CP yield",
+    }))
+
+    keys = list(labels.keys())
+    display = [labels[k] for k in keys]
+
+    with st.form("story1_multidie_form"):
+        scenario_label = st.selectbox("Multi-die scenario", display, index=0)
+        scenario_id = keys[display.index(scenario_label)]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            num_products = st.slider("Products to build", 10, 2000, 200, 10)
+        with c2:
+            baseline_ft = st.slider(
+                "Per-component baseline FT fallout %", 0.0, 20.0, 5.0, 0.5,
+                key="multidie_baseline",
+            )
+
+        gen = st.form_submit_button(
+            "Generate multi-die data", type="primary", use_container_width=True,
+        )
+
+    if gen:
+        req = WaferGenRequest(
+            num_wafers=5,
+            test_count=0,
+            multi_site=False,
+        )
+        apply_fn(req, scenario_id)
+        req.ecid_mode = ecid_mode
+        req.ecid_representation = ecid_representation
+        req.num_multidie_products = int(num_products)
+        req.baseline_ft_fallout = baseline_ft / 100.0
+
+        with st.spinner("Generating multi-die products…"):
+            payload = _run_generation(req)
+        st.session_state["stories_result"] = payload
+        st.session_state.pop("_dl_cache_stories", None)
+
+    if "stories_result" in st.session_state:
+        p = st.session_state["stories_result"]
+        st.divider()
+        _render_result(
+            p["result"], p["sig"], key_prefix="stories",
+            preview_bytes=p.get("preview_bytes"),
+            precomputed=p.get("precomputed"),
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -806,5 +1209,7 @@ _render_sidebar()
 
 if st.session_state["page"] == "manual":
     _render_manual_page()
+elif st.session_state["page"] == "stories":
+    _render_stories_page()
 else:
     _render_chat_page()

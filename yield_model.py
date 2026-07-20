@@ -51,6 +51,12 @@ INSERTION_TEMPS = {"CP1": "25C", "CP2": "-40C", "CP3": "125C"}
 RETEST_SURVIVAL_MIN = 0.90
 RETEST_SURVIVAL_MAX = 0.999
 
+# Baseline yield band for a "no pattern" wafer when the user gave no yield
+# target: an ordinary production wafer with only random background loss.
+# Drawn once per wafer so the lot shows realistic wafer-to-wafer variation.
+NO_PATTERN_YIELD_MIN = 0.93
+NO_PATTERN_YIELD_MAX = 0.97
+
 
 # ---------------------------------------------------------------------------
 # Yield math

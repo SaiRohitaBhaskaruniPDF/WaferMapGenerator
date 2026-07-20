@@ -197,13 +197,18 @@ def compute_die_grid(config: WaferConfig) -> List[Die]:
     """
     Compute all valid die positions that fit within the wafer.
 
-    A die is included if its center falls within (radius - edge_exclusion) of
-    the wafer center. Die centers are spaced by pitch = die size + street.
+    A die is included only if its ENTIRE footprint fits inside the usable
+    circle (radius - edge_exclusion): a real die that crosses the exclusion
+    band (or hangs past the wafer edge) cannot be built or probed. The test
+    checks the die corner farthest from the wafer center. Die centers are
+    spaced by pitch = die size + street.
     """
     radius = config.diameter / 2.0
     active_radius = radius - config.edge_exclusion
     pitch_x = config.pitch_x
     pitch_y = config.pitch_y
+    half_w = config.die_width / 2.0
+    half_h = config.die_height / 2.0
 
     max_ix = int(np.ceil(radius / pitch_x)) + 1
     max_iy = int(np.ceil(radius / pitch_y)) + 1
@@ -214,8 +219,10 @@ def compute_die_grid(config: WaferConfig) -> List[Die]:
             cx = ix * pitch_x + config.x_offset
             cy = iy * pitch_y + config.y_offset
 
-            dist = np.sqrt(cx ** 2 + cy ** 2)
-            if dist <= active_radius:
+            # Distance to the die's farthest corner: the whole rectangle is
+            # inside the circle iff this corner is.
+            corner_dist = np.sqrt((abs(cx) + half_w) ** 2 + (abs(cy) + half_h) ** 2)
+            if corner_dist <= active_radius:
                 dies.append((ix, iy, cx, cy))
 
     return dies

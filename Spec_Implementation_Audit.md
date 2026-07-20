@@ -228,3 +228,104 @@ Generate synthetic wafer maps for demonstration, benchmarking and Software QA pu
 **Bottom line:** every Must-Have (1–12) is implemented. Of the Nice-To-Haves,
 13a, 14, 15, 16, and 17 are done; only **13b (split-lot exposure)** is partial and
 **18 (Repair)** is an intentional placeholder.
+
+---
+
+## Story 1 — ECID Matching to Demo Traceability
+
+Source: *2026.07.14 Yield Stories for Synthetic Data.docx*, section 1.
+
+### 1.a Background
+Context only (ECID = NVM-programmed unique chip ID for CP→FT→field tracking). No
+implementation required.
+
+### 1.b Implementation variants
+- **i. Plain concatenated `(lot)(wafer)(x)(y)`** — ✅ `ecid.format_ecid()`. ECID is now
+  globally unique (lot embedded), fixing a real cross-lot collision bug found during
+  the audit (two CP lots with the same wafer number/die (x,y) used to mint identical
+  ECIDs — a direct risk to the Sweeper story, which combines multiple CP lots).
+- **ii. ROT13 "encrypted" value** — ✅ `ecid.format_ecid(..., mode="rot13")`
+  (`ecid.ECID_MODE_ROT13`). Keeps uniqueness (so DB joins work) while making the value
+  unreadable as a CP map coordinate. Selectable in the Stories UI ("ECID encoding"
+  expander) and via chat keyword (`"rot13"`, `"encrypted"`).
+- **iii. Split into 4 test items** — ✅ `ecid.ecid_components()` /
+  `ecid.concat_ecid_components()`; wired into `generator._build_master_df` and
+  `final_test.build_ft_df` via `ecid_representation="split_items"`, adding
+  `EcidItemLot/Wafer/X/Y` columns alongside the convenience `ECID` column. Selectable
+  in the Stories UI and via chat keyword (`"split test items"`).
+
+### 1.c Two-by-two traceability matrix
+- **Case A (single die, fabless)** — ✅ this is the default behavior of the rest of
+  Story 1 (every other sub-story assumes one CP die → one FT product).
+- **Case B (multiple die, fabless)** — ✅ `multidie.py` — packages 3 component roles
+  (logic/memory/rf, each a different die size, per the spec's own "simple case")
+  into one FT product.
+  - **B.1 full traceability** — ✅ `multidie.MULTIDIE_MODE_FULL` — every component
+    keeps a valid ECID.
+  - **B.2 partial traceability** — ✅ `multidie.MULTIDIE_MODE_PARTIAL` — exactly 1 of
+    3 roles (default: `rf`) never burns an ECID, so that component (and therefore the
+    whole product) is permanently untraceable even when it passes FT.
+  - A product fails FT if ANY component fails (`MultiDieProduct.ft_pass`).
+  - Simplification: component populations are independent Bernoulli(yield) known-good-
+    die pools, not full spatial wafer maps — reasonable given the spec's own "for demo
+    purposes we can set a simple case" note.
+- **Case C/D (IDM/Foundry with ALPS data)** — ⬜ not implemented. The spec itself
+  marks this "TK" (needs ALPS/factory data) and defers it.
+
+### 1.d 1 lot at CP to 1 lot at FT
+- **Simple / detail correct case** — ✅ `assembly.pick_passers_one_to_one`,
+  `assembly.apply_assembly_wrecks`. Detail case keeps blank ECID under 2% by default.
+  The blank-ECID cartesian-join hazard is demonstrated directly by
+  `final_test.naive_ecid_join_explosion()` and covered by
+  `tests/test_story1_ecid.py::test_one_to_one_detail_blank_ecid_join_explosion`.
+
+### 1.e Sweeper lot
+- ✅ `assembly.pick_sweeper` + `assembly.make_ft_lot_id` (FT lot # guaranteed distinct
+  from every source CP lot). Cross-lot ECID uniqueness now verified by
+  `tests/test_story1_ecid.py::test_sweeper_ecids_globally_unique_across_cp_lots`
+  (regression test for the 1.b.i bug fix above).
+
+### 1.f Assembly error — wrong units built
+- **Wrong bin picked** (valid-ECID fail vs blank-ECID fail) — ✅ `assembly.pick_wrong_bin`.
+- **Wrong X/Y** (±1 origin shift, horror ~100 GDPW / subtle ~1000 GDPW, adjustable
+  valid/blank ECID mix default 50/50, simple vs subtle FT fail % default 80%) — ✅
+  `assembly.pick_wrong_xy`, `story1_presets.GDPW_DIE_PRESETS`,
+  `final_test.run_final_test(mispick_ft_fail_pct=...)`.
+
+### 1.g Low yield at FT caused by CP clusters (GDBN)
+- ✅ `gdbn.py` — both cases implemented as a spatial hazard layered onto correctly-
+  picked units (`AssembledUnit.extra_fail_pct`), resolved in
+  `final_test.run_final_test()` before the ordinary baseline FT fallout.
+  - **Dramatic case** — `gdbn.GDBN_MODE_DRAMATIC`: CP signature = clean
+    ("None (Yield Model Only)"); FT-only fallout follows a donut-shaped ring
+    (`gdbn.donut_hazard_mask`, same geometry as `signatures.assign_donut`) evaluated
+    purely on die position, independent of the (all-pass) CP bin.
+  - **Good-die-bad-neighborhood case** — `gdbn.GDBN_MODE_NEIGHBOR`: CP signature =
+    Scratch (real CP fails); passers within `growth` dies (default 1, Chebyshev
+    dilation) of a CP fail get a default 50% FT fail chance
+    (`gdbn.neighbor_hazard_mask`).
+  - Every hazard unit surfaces a `SpatialHazard` / `FailReason` value on the FT CSV so
+    the "invisible at CP, visible at FT" story can be demonstrated by mapping FT
+    results back onto CP (X, Y) via ECID.
+
+### Story 1 summary table
+
+| # | Item | Status |
+|---|------|--------|
+| 1.a | Background | — (context only) |
+| 1.b.i | Plain concatenated ECID | ✅ (+ cross-lot collision bug fixed) |
+| 1.b.ii | ROT13 "encrypted" ECID | ✅ |
+| 1.b.iii | Split into 4 test items | ✅ |
+| 1.c Case A | Single die (fabless) | ✅ (default behavior) |
+| 1.c Case B.1 | Multi-die, full traceability | ✅ |
+| 1.c Case B.2 | Multi-die, partial traceability | ✅ |
+| 1.c Case C/D | IDM/Foundry + ALPS data | ⬜ (spec marks "TK") |
+| 1.d | 1:1 lot, simple/detail | ✅ |
+| 1.e | Sweeper lot, simple/detail | ✅ |
+| 1.f.i | Wrong bin picked | ✅ |
+| 1.f.ii | Wrong X/Y (horror/subtle, ~100/~1000 GDPW) | ✅ |
+| 1.g | GDBN — dramatic case | ✅ |
+| 1.g | GDBN — good-die-bad-neighborhood case | ✅ |
+
+**Bottom line:** every sub-item of Story 1 is now implemented except 1.c Case C/D,
+which the spec document itself defers pending ALPS/factory data.

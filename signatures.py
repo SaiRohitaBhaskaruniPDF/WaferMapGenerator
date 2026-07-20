@@ -907,6 +907,12 @@ def assign_cmp_arc_scratch(dies, radius, arc_radius=None, arc_width=None,
 # Dispatcher
 # ---------------------------------------------------------------------------
 
+# "No pattern" — no spatial signature at all. The generator applies zero
+# signature fails; yield comes purely from the yield model (requested yield /
+# defect density, or the 93-97% per-wafer baseline when neither was given).
+# Distinct from "Full Pass", which is the deliberate 100%-yield wafer.
+NO_PATTERN_SIGNATURE = "None (Yield Model Only)"
+
 SIGNATURE_NAMES = [
     "Edge Ring",
     "Center Cluster",
@@ -915,6 +921,7 @@ SIGNATURE_NAMES = [
     "Quadrant Failure",
     "Bull's-Eye",
     "Full Pass",
+    NO_PATTERN_SIGNATURE,
     "Donut (Mid-Ring)",
     "Half Wafer — Top",
     "Half Wafer — Bottom",
@@ -1004,6 +1011,10 @@ def apply_signature(dies: List[Die], signature_type: str,
     elif s == "Bull's-Eye":
         return assign_bulls_eye(dies, ring_width=radius * 0.15, seed=seed)
     elif s == "Full Pass":
+        return assign_full_pass(dies)
+    elif s == NO_PATTERN_SIGNATURE:
+        # No spatial fails here — the yield model decides which dies die
+        # (see generator.py: baseline 93-97% per wafer when no yield given).
         return assign_full_pass(dies)
     elif s == "Donut (Mid-Ring)":
         return assign_donut(dies, inner_r=radius * 0.25, outer_r=radius * 0.60, seed=seed)

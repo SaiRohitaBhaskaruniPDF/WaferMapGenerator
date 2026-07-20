@@ -26,6 +26,7 @@ Credentials can also be loaded from a `.env` file in the project root
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -38,7 +39,7 @@ from geometry import (
     clamp_die_size, clamp_street, EDGE_EXCLUSION_MIN, EDGE_EXCLUSION_MAX,
     STREET_DEFAULT,
 )
-from signatures import SIGNATURE_NAMES, SCRATCH_FAMILIES
+from signatures import SIGNATURE_NAMES, SCRATCH_FAMILIES, NO_PATTERN_SIGNATURE
 from test_items import TEST_COUNT_CHOICES
 from binning import HARDBIN_CHOICES, SOFTBIN_MULTIPLIERS
 from fab import LOT_CADENCES
@@ -130,6 +131,9 @@ class WaferGenRequest:
     yield_mode: str = "signature"    # 'signature' | 'direct' | 'defect_density'
     target_yield_pct: Optional[float] = None   # for 'direct' (0..100)
     defect_density: Optional[float] = None     # defects/cm² for Y = e^(-A*D)
+    # ±% per-wafer jitter: each wafer varies its defect density (or direct
+    # yield target) by a random amount inside this band. 0 = no variation.
+    yield_variation_pct: float = 0.0
 
     # ---- Test insertions (spec "Test insertions" section) -------------------
     num_insertions: int = 1          # 1 = CP1, 2 = +CP2, 3 = +CP3
@@ -158,6 +162,33 @@ class WaferGenRequest:
     # shared die. `signature` (singular) mirrors signatures[0] for legacy code.
     signatures: List[str] = field(default_factory=lambda: ["Edge Ring"])
     signature: str = "Edge Ring"
+
+    # ---- Story 1: ECID matching / FT traceability ------------------------------
+    # story_id: "none" keeps legacy CP-only behaviour.
+    #   "story1"          -> assembly + FT (1:1 / sweeper / wrong-bin / wrong-xy)
+    #   "story1_gdbn"      -> low yield at FT caused by CP clusters (spec 1.g)
+    #   "story1_multidie"  -> multi-die product traceability, Case B (spec 1.c)
+    story_id: str = "none"
+    story1_scenario: str = "one_to_one_simple"
+    blank_ecid_pct: Optional[float] = None   # None = use scenario default
+    valid_ecid_mix: Optional[float] = None   # fraction of mis-picks with valid ECID
+    mispick_ft_fail_pct: Optional[float] = None  # 1.0 simple, 0.8 subtle
+    baseline_ft_fallout: float = 0.03        # FT fail rate on correctly picked units
+    xy_shift: Optional[tuple] = None         # e.g. (1, 0); None = random ±1
+    ship_insertion: str = ""                 # "" = last CP insertion
+
+    # ECID encoding variants (spec 1.b)
+    ecid_mode: str = "plain"                 # "plain" | "rot13"
+    ecid_representation: str = "single"      # "single" | "split_items" (1.b.iii)
+
+    # Story 1g: GDBN / missed-CP-cluster knobs
+    gdbn_scenario: str = "gdbn_neighbor"      # "gdbn_neighbor" | "gdbn_dramatic"
+    gdbn_growth: Optional[int] = None         # None = scenario default (1)
+    gdbn_fail_pct: Optional[float] = None     # None = scenario default (0.5)
+
+    # Story 1c: multi-die product (Case B) knobs
+    multidie_mode: str = "full_trace"         # "full_trace" (B.1) | "partial_trace" (B.2)
+    num_multidie_products: int = 0            # 0 = derive from num_wafers
 
     # Explanation the LLM provides (shown to user)
     explanation: str = ""
@@ -305,6 +336,15 @@ _FUNCTION_SCHEMA = {
                 "type": "number",
                 "description": "Defect density in defects/cm2 (yield_mode='defect_density').",
             },
+            "yield_variation_pct": {
+                "type": "number",
+                "description": (
+                    "Per-wafer yield variation in ±percent (0-50). E.g. "
+                    "'yield variation +/- 20% defect density' -> 20. Each "
+                    "wafer jitters its defect density (or direct yield "
+                    "target) randomly inside this band."
+                ),
+            },
             "num_insertions": {
                 "type": "integer",
                 "description": (
@@ -374,7 +414,10 @@ _FUNCTION_SCHEMA = {
                 ),
             },
         },
-        "required": ["signatures", "num_wafers", "explanation"],
+        # Only the explanation is mandatory: on follow-up ("change X, keep the
+        # rest") messages the model should return JUST the fields that change,
+        # and the previous request supplies everything else.
+        "required": ["explanation"],
     },
 }
 
@@ -412,6 +455,13 @@ to the generic "Scratch / Streak".
   "wand"/"manual"/"by hand"/"operator" -> Wafer-Wand Scratch;
   "CMP"/"polish"/"slurry"/"pad" -> CMP Arc Scratch.
 
+NO PATTERN: if the user asks for "no pattern", "no signature", "no spatial
+signature", or plain/ordinary wafers, use "{NO_PATTERN_SIGNATURE}" — do NOT
+substitute Random Scatter or any other pattern. Yield then comes purely from
+the yield model; if the user also gave no yield, the tool applies a 93-97%
+per-wafer baseline (mention that in your explanation). "Full Pass" is only
+for explicitly perfect / 100%-yield wafers.
+
 REPEATERS & STRIPING: "repeater"/"repeating bad die" -> Reticle Pattern.
 "soft repeater" -> Reticle Pattern with repeater_fail_rate 0.1-0.9.
 "striping"/"stripe"/"lens tilt" -> one of the Striping signatures
@@ -433,6 +483,10 @@ YIELD: if the user gives a yield percentage ("92% yield") set
 yield_mode='direct' and target_yield_pct. If they give a defect density
 ("0.5 defects per cm2") set yield_mode='defect_density' and defect_density
 (the tool applies Y = e^(-A*D)). Otherwise leave yield_mode='signature'.
+If they ask for per-wafer yield/defect-density variation ("+/- 20%",
+"vary by 10%"), set yield_variation_pct. If they ask for anything the
+schema cannot express, say so plainly in the explanation instead of
+claiming it was applied.
 
 INSERTIONS: "CP1 and CP2" or "two insertions" -> num_insertions=2;
 "CP1, CP2, CP3" / "hot cold room" -> 3. Default 1.
@@ -458,6 +512,13 @@ lot_cadence ("1 lot per month" / "1 lot per week" / "1 lot per day" /
 
 LOT / PROGRAM: invent plausible IDs if not specified (e.g. LOT_A01, PRD_HBN20).
 
+FOLLOW-UP MESSAGES: when a "CURRENT PARAMETERS" block is provided, the user is
+modifying an earlier request. Return ONLY the parameters that should change;
+every omitted parameter keeps its current value. Do NOT re-guess signatures,
+die size, wafer count etc. unless the user explicitly changes them. Note that
+"edge exclusion" is the keep-out band in mm (edge_exclusion) — it is NOT the
+Edge Ring signature.
+
 Write a concise one-sentence explanation that tells the user what you chose and why.
 """
 
@@ -471,7 +532,7 @@ _DEFAULT_AZURE_DEPLOYMENT = "gpt-4.1"
 _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 
-def _parse_tool_args(response) -> dict:
+def _parse_tool_args(response, has_previous: bool = False) -> dict:
     """Extract JSON arguments from a chat completion tool call."""
     message = response.choices[0].message
     tool_calls = message.tool_calls or []
@@ -490,19 +551,34 @@ def _parse_tool_args(response) -> dict:
     if isinstance(sigs, str):
         sigs = [sigs]
     sigs = [s for s in sigs if s in SIGNATURE_NAMES]
-    if not sigs:
-        sigs = ["Edge Ring"]
-    args["signatures"] = sigs
-    args["signature"] = sigs[0]
+    if sigs:
+        args["signatures"] = sigs
+        args["signature"] = sigs[0]
+    elif has_previous:
+        # Follow-up message with no (valid) signature mentioned: drop the key
+        # entirely so the merge keeps the previous request's signatures.
+        args.pop("signatures", None)
+        args.pop("signature", None)
+    else:
+        args["signatures"] = ["Edge Ring"]
+        args["signature"] = "Edge Ring"
 
-    args["num_wafers"] = _clamp_wafers(args.get("num_wafers", 25))
+    if "num_wafers" in args:
+        args["num_wafers"] = _clamp_wafers(args["num_wafers"])
     return args
 
 
-def _args_to_request(args: dict) -> WaferGenRequest:
+def _args_to_request(args: dict,
+                     base: Optional[WaferGenRequest] = None) -> WaferGenRequest:
     """Map raw LLM tool arguments onto a WaferGenRequest, clamping every
     numeric field into its spec range so a hallucinated value can never
-    produce an illegal wafer."""
+    produce an illegal wafer.
+
+    When `base` is given (a follow-up message in the chat), every field the
+    LLM did NOT return keeps its value from the previous request instead of
+    resetting to the factory default — "change X, keep the rest" behavior.
+    """
+    d = base if base is not None else WaferGenRequest()
 
     def _num(key, default, lo=None, hi=None, cast=float):
         v = cast(args.get(key, default))
@@ -512,48 +588,89 @@ def _args_to_request(args: dict) -> WaferGenRequest:
             v = min(hi, v)
         return v
 
+    def _choice(key, default, choices):
+        v = args.get(key, default)
+        return v if v in choices else default
+
+    num_lots = _num("num_lots", d.num_lots, 1, 60, cast=int)
+    s2s_enabled = bool(args.get("s2s_enabled", d.s2s_enabled))
     return WaferGenRequest(
-        diameter=snap_diameter(args.get("diameter", 300.0)),
-        edge_type=args.get("edge_type", ""),
-        edge_exclusion=_num("edge_exclusion", 3.0, EDGE_EXCLUSION_MIN, EDGE_EXCLUSION_MAX),
-        die_width=_num("die_width", 10.0, 1.0, 35.0),
-        die_height=_num("die_height", 10.0, 1.0, 35.0),
-        street_width=clamp_street(args.get("street_width", STREET_DEFAULT)),
-        edge_orientation=args.get("edge_orientation", "down"),
-        lot_id=args.get("lot_id", "LOT_001"),
-        program=args.get("program", "DEMO"),
-        num_wafers=args.get("num_wafers", 25),
-        num_lots=_num("num_lots", 1, 1, 60, cast=int),
-        lot_cadence=args.get("lot_cadence", "1 lot per week"),
-        auto_lot_id=int(args.get("num_lots", 1)) > 1,
-        yield_mode=args.get("yield_mode", "signature"),
-        target_yield_pct=args.get("target_yield_pct"),
-        defect_density=args.get("defect_density"),
-        num_insertions=_num("num_insertions", 1, 1, 3, cast=int),
-        hardbin_count=(args.get("hardbin_count", 16)
-                       if args.get("hardbin_count") in HARDBIN_CHOICES else 16),
-        softbin_multiplier=(args.get("softbin_multiplier", 4)
-                            if args.get("softbin_multiplier") in SOFTBIN_MULTIPLIERS else 4),
-        test_count=(args.get("test_count", 100)
-                    if args.get("test_count") in TEST_COUNT_CHOICES else 100),
-        parametric_pct=_num("parametric_pct", 50, 0, 100, cast=int) // 10 * 10,
-        seconds_per_touchdown=_num("seconds_per_touchdown", 1.0, 1.0, 600.0),
-        multi_site=bool(args.get("multi_site", True)),
-        s2s_enabled=bool(args.get("s2s_enabled", False)),
-        s2s_healthy=not bool(args.get("s2s_enabled", False)),
-        repeater_fail_rate=_num("repeater_fail_rate", 1.0, 0.1, 1.0),
-        signatures=args.get("signatures", [args.get("signature", "Edge Ring")]),
+        diameter=snap_diameter(args.get("diameter", d.diameter)),
+        edge_type=args.get("edge_type", d.edge_type if base is not None else ""),
+        edge_exclusion=_num("edge_exclusion", d.edge_exclusion,
+                            EDGE_EXCLUSION_MIN, EDGE_EXCLUSION_MAX),
+        die_width=_num("die_width", d.die_width, 1.0, 35.0),
+        die_height=_num("die_height", d.die_height, 1.0, 35.0),
+        street_width=clamp_street(args.get("street_width", d.street_width)),
+        edge_orientation=args.get("edge_orientation", d.edge_orientation),
+        lot_id=args.get("lot_id", d.lot_id),
+        program=args.get("program", d.program),
+        num_wafers=_clamp_wafers(args.get("num_wafers", d.num_wafers)),
+        num_lots=num_lots,
+        lot_cadence=args.get("lot_cadence", d.lot_cadence),
+        auto_lot_id=num_lots > 1,
+        yield_mode=args.get("yield_mode", d.yield_mode),
+        target_yield_pct=args.get("target_yield_pct", d.target_yield_pct),
+        defect_density=args.get("defect_density", d.defect_density),
+        yield_variation_pct=_num("yield_variation_pct", d.yield_variation_pct,
+                                 0.0, 50.0),
+        num_insertions=_num("num_insertions", d.num_insertions, 1, 3, cast=int),
+        hardbin_count=_choice("hardbin_count", d.hardbin_count, HARDBIN_CHOICES),
+        softbin_multiplier=_choice("softbin_multiplier", d.softbin_multiplier,
+                                   SOFTBIN_MULTIPLIERS),
+        test_count=_choice("test_count", d.test_count, TEST_COUNT_CHOICES),
+        parametric_pct=_num("parametric_pct", d.parametric_pct, 0, 100,
+                            cast=int) // 10 * 10,
+        seconds_per_touchdown=_num("seconds_per_touchdown",
+                                   d.seconds_per_touchdown, 1.0, 600.0),
+        multi_site=bool(args.get("multi_site", d.multi_site)),
+        s2s_enabled=s2s_enabled,
+        s2s_healthy=not s2s_enabled,
+        repeater_fail_rate=_num("repeater_fail_rate", d.repeater_fail_rate,
+                                0.1, 1.0),
+        signatures=list(args.get("signatures", d.signatures)),
         explanation=args.get("explanation", ""),
         used_llm=True,
     )
 
 
-def _chat_completion_kwargs(user_prompt: str) -> dict:
+# Fields echoed back to the LLM as context for follow-up messages. Keep in
+# sync with _FUNCTION_SCHEMA property names so the model can mirror them.
+_CONTEXT_FIELDS = (
+    "diameter", "edge_type", "edge_exclusion", "die_width", "die_height",
+    "street_width", "edge_orientation", "lot_id", "program", "num_wafers",
+    "num_lots", "lot_cadence", "yield_mode", "target_yield_pct",
+    "defect_density", "yield_variation_pct",
+    "num_insertions", "hardbin_count", "softbin_multiplier",
+    "test_count", "parametric_pct", "seconds_per_touchdown", "multi_site",
+    "s2s_enabled", "repeater_fail_rate", "signatures",
+)
+
+
+def _request_context_json(req: WaferGenRequest) -> str:
+    """Compact JSON of the previous request, for the follow-up context block."""
+    return json.dumps({f: getattr(req, f) for f in _CONTEXT_FIELDS})
+
+
+def _chat_completion_kwargs(
+    user_prompt: str,
+    previous_request: Optional[WaferGenRequest] = None,
+) -> dict:
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    if previous_request is not None:
+        messages.append({
+            "role": "system",
+            "content": (
+                "CURRENT PARAMETERS (from the user's previous request):\n"
+                f"{_request_context_json(previous_request)}\n"
+                "The next user message may be a follow-up modification. "
+                "Return ONLY the parameters that should change; omitted "
+                "parameters keep the values above."
+            ),
+        })
+    messages.append({"role": "user", "content": user_prompt})
     return {
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
+        "messages": messages,
         "tools": [{"type": "function", "function": _FUNCTION_SCHEMA}],
         "tool_choice": {"type": "function", "function": {"name": "generate_wafer_maps"}},
         "temperature": 0.3,
@@ -567,6 +684,7 @@ def _call_azure_openai(
     azure_endpoint: str,
     deployment: str,
     api_version: str,
+    previous_request: Optional[WaferGenRequest] = None,
 ) -> WaferGenRequest:
     """Send the user message to Azure OpenAI and parse the function-call response."""
     try:
@@ -582,12 +700,18 @@ def _call_azure_openai(
 
     response = client.chat.completions.create(
         model=deployment,
-        **_chat_completion_kwargs(user_prompt),
+        **_chat_completion_kwargs(user_prompt, previous_request),
     )
-    return _args_to_request(_parse_tool_args(response))
+    args = _parse_tool_args(response, has_previous=previous_request is not None)
+    return _args_to_request(args, base=previous_request)
 
 
-def _call_openai(user_prompt: str, api_key: str, model: str) -> WaferGenRequest:
+def _call_openai(
+    user_prompt: str,
+    api_key: str,
+    model: str,
+    previous_request: Optional[WaferGenRequest] = None,
+) -> WaferGenRequest:
     """Send the user message to OpenAI and parse the function-call response."""
     try:
         from openai import OpenAI  # type: ignore
@@ -597,9 +721,10 @@ def _call_openai(user_prompt: str, api_key: str, model: str) -> WaferGenRequest:
     client = OpenAI(api_key=api_key)
     response = client.chat.completions.create(
         model=model,
-        **_chat_completion_kwargs(user_prompt),
+        **_chat_completion_kwargs(user_prompt, previous_request),
     )
-    return _args_to_request(_parse_tool_args(response))
+    args = _parse_tool_args(response, has_previous=previous_request is not None)
+    return _args_to_request(args, base=previous_request)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +733,10 @@ def _call_openai(user_prompt: str, api_key: str, model: str) -> WaferGenRequest:
 
 _KEYWORD_MAP = {
     # Pattern keywords → signature name
+    # "No pattern" FIRST: an explicit request for no spatial signature must
+    # never fall through to a pattern (or to the Edge Ring default).
+    r"no.?pattern|no.?signature|no.?spatial|patternless|plain.?wafer|clean.?wafer|blank.?wafer":
+        NO_PATTERN_SIGNATURE,
     r"edge.?ring|peripheral.?ring|edge.?fail": "Edge Ring",
     r"center|centre|chuck|middle.?fail":        "Center Cluster",
     # --- Scratch families FIRST, so a specific tool word wins over the
@@ -702,8 +831,8 @@ def _parse_edge_type(text: str) -> str | None:
     return None
 
 
-def _parse_edge_orientation(text: str) -> str:
-    """Notch/flat position: down (default), up, left or right."""
+def _parse_edge_orientation(text: str) -> str | None:
+    """Notch/flat position: up/left/right/down, or None if not mentioned."""
     t = text.lower()
     if re.search(r"(?:notch|flat)\s*up|(?:notch|flat)\s*top|notch\s*12", t):
         return "up"
@@ -711,7 +840,9 @@ def _parse_edge_orientation(text: str) -> str:
         return "left"
     if re.search(r"(?:notch|flat)\s*right|notch\s*3", t):
         return "right"
-    return "down"
+    if re.search(r"(?:notch|flat)\s*(?:down|bottom)|notch\s*6", t):
+        return "down"
+    return None
 
 
 def _parse_yield(text: str) -> tuple[str, float | None, float | None]:
@@ -731,22 +862,41 @@ def _parse_yield(text: str) -> tuple[str, float | None, float | None]:
     return "signature", None, None
 
 
-def _parse_insertions(text: str) -> int:
-    """How many CP insertions the user wants (1, 2 or 3)."""
+def _parse_yield_variation(text: str) -> float | None:
+    """Detect per-wafer yield variation: '+/- 20%', '±20%', 'vary by 10%',
+    '20% variation'. Returns the ±percent, or None if not mentioned."""
+    t = text.lower()
+    m = re.search(r"(?:±|\+/-|\+-)\s*(\d+(?:\.\d+)?)\s*%", t)
+    if m:
+        return float(m.group(1))
+    m = re.search(
+        r"(?:variation|vary(?:ing)?)\s*(?:of|by)?\s*(\d+(?:\.\d+)?)\s*%"
+        r"|(\d+(?:\.\d+)?)\s*%\s*(?:yield\s*|defect\s*density\s*)?variation",
+        t,
+    )
+    if m:
+        return float(m.group(1) or m.group(2))
+    return None
+
+
+def _parse_insertions(text: str) -> int | None:
+    """How many CP insertions the user wants (1-3), or None if not mentioned."""
     t = text.lower()
     if re.search(r"cp3|three\s*insertions|3\s*insertions|hot.*cold|cold.*hot", t):
         return 3
     if re.search(r"cp2|two\s*insertions|2\s*insertions|retest", t):
         return 2
-    return 1
+    if re.search(r"cp1|one\s*insertion|1\s*insertion|single\s*insertion", t):
+        return 1
+    return None
 
 
-def _parse_lots(text: str) -> tuple[int, str]:
-    """Detect multi-lot requests: returns (num_lots, cadence label)."""
+def _parse_lots(text: str) -> tuple[int | None, str | None]:
+    """Detect multi-lot requests: (num_lots, cadence), None where unmentioned."""
     t = text.lower()
     m = re.search(r"(\d+)\s*lots", t)
-    num_lots = int(m.group(1)) if m else 1
-    cadence = "1 lot per week"
+    num_lots = max(1, min(60, int(m.group(1)))) if m else None
+    cadence = None
     if re.search(r"per\s*month|monthly", t):
         cadence = "1 lot per month"
     elif re.search(r"lots\s*per\s*day|multiple\s*lots", t):
@@ -754,7 +904,9 @@ def _parse_lots(text: str) -> tuple[int, str]:
         cadence = "multiple lots per day"
     elif re.search(r"per\s*day|daily", t):
         cadence = "1 lot per day"
-    return max(1, min(60, num_lots)), cadence
+    elif re.search(r"per\s*week|weekly", t):
+        cadence = "1 lot per week"
+    return num_lots, cadence
 
 
 def _format_street_width(street_width: float) -> str:
@@ -765,10 +917,16 @@ def _format_street_width(street_width: float) -> str:
     return f" Street width: {street_width} mm."
 
 
-def _keyword_parse(text: str) -> WaferGenRequest:
-    """Best-effort keyword extraction without an LLM."""
+def _keyword_parse(text: str,
+                   base: Optional[WaferGenRequest] = None) -> WaferGenRequest:
+    """Best-effort keyword extraction without an LLM.
+
+    When `base` is given (a follow-up chat message), start from a copy of the
+    previous request and only overwrite fields this message actually mentions.
+    """
     t = text.lower()
-    req = WaferGenRequest()
+    is_followup = base is not None
+    req = copy.deepcopy(base) if is_followup else WaferGenRequest()
 
     # Signature(s): collect EVERY pattern that matches (not just the first),
     # so "edge ring and a scratch" yields multiple signatures. Keep insertion
@@ -814,31 +972,61 @@ def _keyword_parse(text: str) -> WaferGenRequest:
         req.die_width, req.die_height = die_size
 
     # Diameter — e.g. "200 mm wafer"; snapped to 150/200/300 later anyway.
+    diameter_parsed = False
     m = re.search(r"(\d+(?:\.\d+)?)\s*mm\s*(?:wafer|diameter)", t)
     if m:
         req.diameter = snap_diameter(float(m.group(1)))
+        diameter_parsed = True
     else:
         for d in (300, 200, 150):
             if re.search(rf"\b{d}\s*mm\b", t):
                 req.diameter = float(d)
+                diameter_parsed = True
                 break
 
     edge_type = _parse_edge_type(text)
     if edge_type:
         req.edge_type = edge_type
-    else:
+    elif not is_followup or diameter_parsed:
         req.edge_type = auto_edge_type(req.diameter)
 
-    req.edge_orientation = _parse_edge_orientation(text)
+    orientation = _parse_edge_orientation(text)
+    if orientation is not None:
+        req.edge_orientation = orientation
 
     street_width = _parse_street_width_mm(text)
     if street_width is not None:
         req.street_width = clamp_street(street_width)
 
+    # Edge exclusion — "5 mm edge exclusion" / "edge exclusion of 5 mm".
+    m = re.search(
+        r"(\d+(?:\.\d+)?)\s*mm\s*edge\s*exclusion"
+        r"|edge\s*exclusion\s*(?:zone\s*)?(?:of\s*|to\s*|=\s*)?(\d+(?:\.\d+)?)\s*mm",
+        t,
+    )
+    if m:
+        req.edge_exclusion = max(EDGE_EXCLUSION_MIN,
+                                 min(EDGE_EXCLUSION_MAX,
+                                     float(m.group(1) or m.group(2))))
+
     # Yield / insertions / lots — the spec "must have" numeric knobs.
-    req.yield_mode, req.target_yield_pct, req.defect_density = _parse_yield(text)
-    req.num_insertions = _parse_insertions(text)
-    req.num_lots, req.lot_cadence = _parse_lots(text)
+    # On follow-ups, only overwrite what this message actually mentions.
+    yield_mode, target_yield, density = _parse_yield(text)
+    if not is_followup or yield_mode != "signature":
+        req.yield_mode = yield_mode
+        req.target_yield_pct = target_yield
+        req.defect_density = density
+    variation = _parse_yield_variation(text)
+    if variation is not None:
+        req.yield_variation_pct = max(0.0, min(50.0, variation))
+    num_insertions = _parse_insertions(text)
+    if num_insertions is not None:
+        req.num_insertions = num_insertions
+    num_lots, lot_cadence = _parse_lots(text)
+    if num_lots is not None:
+        req.num_lots = num_lots
+    if lot_cadence is not None:
+        req.lot_cadence = lot_cadence
     req.auto_lot_id = req.num_lots > 1
 
     # Test time — "5 seconds per touchdown" / "test time 30 s".
@@ -851,6 +1039,29 @@ def _keyword_parse(text: str) -> WaferGenRequest:
     if re.search(r"s2s|site.?to.?site|bad\s*site|weak\s*site", t):
         req.s2s_enabled = True
         req.s2s_healthy = False
+
+    # Story 1 — ECID / FT / sweeper / assembly errors
+    gdbn_scenario = _parse_gdbn_scenario(t)
+    multidie_scenario = _parse_multidie_scenario(t)
+    story_scenario = _parse_story1_scenario(t)
+    if gdbn_scenario:
+        req.story_id = "story1_gdbn"
+        req.gdbn_scenario = gdbn_scenario
+    elif multidie_scenario:
+        req.story_id = "story1_multidie"
+        req.multidie_mode = multidie_scenario
+    elif story_scenario:
+        from story1_presets import apply_scenario_to_request
+        req.story_id = "story1"
+        req.story1_scenario = story_scenario
+        apply_scenario_to_request(req, story_scenario)
+
+    ecid_mode = _parse_ecid_mode(t)
+    if ecid_mode:
+        req.ecid_mode = ecid_mode
+    ecid_repr = _parse_ecid_representation(t)
+    if ecid_repr:
+        req.ecid_representation = ecid_repr
 
     # Lot ID
     m = re.search(r"lot[_\s-]?(\w+)", t, re.IGNORECASE)
@@ -872,17 +1083,131 @@ def _keyword_parse(text: str) -> WaferGenRequest:
         req.explanation += f" Target yield {req.target_yield_pct:g}%."
     elif req.yield_mode == "defect_density":
         req.explanation += f" Defect density {req.defect_density:g}/cm² (Y = e^(-A·D))."
+    if req.yield_variation_pct > 0 and req.yield_mode != "signature":
+        req.explanation += f" ±{req.yield_variation_pct:g}% per-wafer variation."
+    if req.yield_mode == "signature" and NO_PATTERN_SIGNATURE in req.signatures:
+        req.explanation += (
+            " No yield specified — using a 93-97% per-wafer baseline "
+            "(give a yield % or defect density to override)."
+        )
     if req.num_insertions > 1:
         req.explanation += f" Insertions: CP1..CP{req.num_insertions}."
     if req.num_lots > 1:
         req.explanation += f" {req.num_lots} lots, {req.lot_cadence}."
+    if req.story_id == "story1":
+        req.explanation += f" Story 1 scenario: {req.story1_scenario}."
+    elif req.story_id == "story1_gdbn":
+        req.explanation += f" Story 1g (GDBN) scenario: {req.gdbn_scenario}."
+    elif req.story_id == "story1_multidie":
+        req.explanation += f" Story 1c (multi-die) scenario: {req.multidie_mode}."
+    if req.ecid_mode != "plain":
+        req.explanation += f" ECID mode: {req.ecid_mode}."
+    if req.ecid_representation != "single":
+        req.explanation += f" ECID representation: {req.ecid_representation}."
     req.used_llm = False
     return req
+
+
+def _parse_story1_scenario(t: str) -> Optional[str]:
+    """Map natural-language phrases onto a Story 1 scenario id."""
+    if re.search(r"sweeper", t):
+        if re.search(r"detail|blank\s*ecid|no\s*ecid|< ?2%|assembly\s*wreck", t):
+            return "sweeper_detail"
+        return "sweeper_simple"
+    if re.search(r"wrong\s*bin|mis-?pick(?:ed)?\s*bin|fail\s*bin\s*picked", t):
+        return "wrong_bin"
+    if re.search(r"wrong\s*(?:x|y|xy)|origin\s*shift|shifted\s*(?:x|y|xy|origin)", t):
+        horror = bool(re.search(r"horror|100\s*gdpw|low\s*gdpw|large\s*die", t))
+        high = bool(re.search(r"1000\s*gdpw|high\s*gdpw|subtle\s*case|small\s*die", t))
+        subtle_ft = bool(re.search(r"subtle\s*ft|80\s*%|adjustable\s*fail", t))
+        if high or (not horror and re.search(r"subtle", t) and not subtle_ft):
+            return ("wrong_xy_1000_subtle_ft" if subtle_ft
+                    else "wrong_xy_1000_simple")
+        if horror or re.search(r"100\s*gdpw", t):
+            return ("wrong_xy_horror_subtle_ft" if subtle_ft
+                    else "wrong_xy_horror_simple")
+        return "wrong_xy_horror_simple"
+    if re.search(r"ecid|traceability|final\s*test|\bft\b|1\s*:\s*1|one.to.one", t):
+        if re.search(r"detail|blank\s*ecid|no\s*ecid|< ?2%|assembly\s*wreck", t):
+            return "one_to_one_detail"
+        if re.search(r"simple|match|trace", t) or re.search(r"ecid|final\s*test|\bft\b", t):
+            return "one_to_one_simple"
+    return None
+
+
+def _parse_ecid_mode(t: str) -> Optional[str]:
+    """Detect spec 1.b.ii/iii ECID encoding requests ('rot13', 'split test items')."""
+    if re.search(r"rot ?13|encrypt", t):
+        return "rot13"
+    return None
+
+
+def _parse_ecid_representation(t: str) -> Optional[str]:
+    if re.search(r"split.*(?:test\s*item|ecid)|4\s*test\s*items|multiple\s*test\s*items", t):
+        return "split_items"
+    return None
+
+
+def _parse_gdbn_scenario(t: str) -> Optional[str]:
+    """Spec 1.g: low yield at FT caused by CP clusters (GDBN)."""
+    if re.search(r"gdbn|bad\s*neighbo(?:u)?rhood|good\s*die\s*bad", t):
+        return "gdbn_neighbor"
+    if re.search(r"missed?\s*(?:cp\s*)?cluster|cp\s*cluster.*(?:ft|final\s*test)"
+                 r"|dramatic\s*case|donut.*(?:invisible|missed)|invisible.*cp", t):
+        return "gdbn_dramatic"
+    return None
+
+
+def _parse_multidie_scenario(t: str) -> Optional[str]:
+    """Spec 1.c: multi-die product traceability (Case B of the 2x2 matrix)."""
+    if not re.search(r"multi.?die|chiplet|multi.?chip|package[d]?\s*product|\bmcm\b|case\s*b", t):
+        return None
+    if re.search(r"partial|annoying|missing\s*trace|no\s*trace|2\s*of\s*3", t):
+        return "partial_trace"
+    return "full_trace"
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+def _apply_story1_from_prompt(req: WaferGenRequest, user_prompt: str) -> WaferGenRequest:
+    """Enable Story 1 when the user prompt asks for ECID / FT / sweeper / etc.
+
+    Applied after BOTH LLM and keyword parsing so Azure GPT runs still get
+    FT + match exports (the tool schema does not yet expose story fields).
+    """
+    t = user_prompt.lower()
+    ecid_mode = _parse_ecid_mode(t)
+    if ecid_mode:
+        req.ecid_mode = ecid_mode
+    ecid_repr = _parse_ecid_representation(t)
+    if ecid_repr:
+        req.ecid_representation = ecid_repr
+
+    gdbn_scenario = _parse_gdbn_scenario(t)
+    multidie_scenario = _parse_multidie_scenario(t)
+    scenario = _parse_story1_scenario(t)
+
+    if gdbn_scenario:
+        req.story_id = "story1_gdbn"
+        req.gdbn_scenario = gdbn_scenario
+        req.explanation = (req.explanation or "").rstrip() + (
+            f" Story 1g (GDBN) scenario: {gdbn_scenario}.")
+    elif multidie_scenario:
+        req.story_id = "story1_multidie"
+        req.multidie_mode = multidie_scenario
+        req.explanation = (req.explanation or "").rstrip() + (
+            f" Story 1c (multi-die) scenario: {multidie_scenario}.")
+    elif scenario:
+        from story1_presets import apply_scenario_to_request
+        # Preserve LLM-chosen lot/wafer counts when already set sensibly;
+        # presets still bump sweeper to ≥2 lots if needed.
+        apply_scenario_to_request(req, scenario)
+        if "Story 1 scenario" not in (req.explanation or ""):
+            req.explanation = (req.explanation or "").rstrip() + f" Story 1 scenario: {scenario}."
+    return req
+
 
 def parse_user_request(
     user_prompt: str,
@@ -891,9 +1216,14 @@ def parse_user_request(
     azure_endpoint: Optional[str] = None,
     azure_deployment: Optional[str] = None,
     azure_api_version: Optional[str] = None,
+    previous_request: Optional[WaferGenRequest] = None,
 ) -> WaferGenRequest:
     """
     Parse a natural-language wafer map request.
+
+    `previous_request` is the last request generated in this chat session (or
+    None for the first message). When set, the new message is treated as a
+    modification: unmentioned parameters keep their previous values.
 
     Priority:
       1. Azure OpenAI if endpoint + key are available
@@ -915,22 +1245,26 @@ def parse_user_request(
 
     try:
         if azure_key and azure_endpoint:
-            return _call_azure_openai(
+            req = _call_azure_openai(
                 user_prompt,
                 api_key=azure_key,
                 azure_endpoint=azure_endpoint,
                 deployment=azure_deployment,
                 api_version=azure_api_version,
+                previous_request=previous_request,
             )
+            return _apply_story1_from_prompt(req, user_prompt)
         if openai_key:
             model = os.environ.get("OPENAI_MODEL", _DEFAULT_OPENAI_MODEL).strip()
-            return _call_openai(user_prompt, openai_key, model)
+            req = _call_openai(user_prompt, openai_key, model,
+                               previous_request=previous_request)
+            return _apply_story1_from_prompt(req, user_prompt)
     except Exception as exc:
-        req = _keyword_parse(user_prompt)
+        req = _keyword_parse(user_prompt, base=previous_request)
         req.explanation = (
             f"⚠️ LLM call failed ({exc}). Using keyword parser instead. "
             + req.explanation
         )
         return req
 
-    return _keyword_parse(user_prompt)
+    return _keyword_parse(user_prompt, base=previous_request)
