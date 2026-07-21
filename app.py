@@ -339,21 +339,37 @@ def _render_downloads(result: GenerationResult, key_prefix: str, precomputed=Non
 def _render_result(result: GenerationResult, sig_name: str, key_prefix: str,
                    preview_bytes=None, precomputed=None):
     """Inline wafer maps, summaries and downloads for one generation run."""
-    lot = result.primary_lot
+    n_lots = len(result.lots)
+    lot_idx = 0
+    if n_lots > 1:
+        # Multiple lots were generated (e.g. "4 lots per week") — make that
+        # obvious up front instead of burying it in a collapsed expander, and
+        # let the user flip through each lot's wafer maps.
+        lot_idx = st.selectbox(
+            f"Lot ({n_lots} generated this run)",
+            options=list(range(n_lots)),
+            format_func=lambda i: f"{result.lots[i].lot_id}  ·  lot {i + 1} of {n_lots}  ·  "
+                                  f"sort start {result.lots[i].start_time.strftime('%Y-%m-%d %H:%M')}",
+            key=f"{key_prefix}_lot_select",
+        )
+    lot = result.lots[lot_idx]
     cp1_wafers = lot.insertion_wafers("CP1")
     titles = lot.wafer_ids
     yields = _compute_yields(cp1_wafers)
     total_dies = len(cp1_wafers[0]) if cp1_wafers else 0
     avg_yield = sum(yields) / len(yields) if yields else 0
 
+    lot_note = f" · lot {lot_idx + 1} of {n_lots}" if n_lots > 1 else ""
     st.caption(
         f"{lot.lot_id} · {sig_name} · {len(lot.wafers)} wafers · "
         f"{total_dies} dies/wafer · {avg_yield:.1f}% CP1 avg yield · "
-        f"{_config_summary(result, sig_name)}"
+        f"{_config_summary(result, sig_name)}{lot_note}"
     )
 
-    # CP1 maps of the first lot (the primary preview).
-    if preview_bytes:
+    # CP1 maps for the selected lot. Only lot 1 can reuse the precomputed
+    # preview image — switching to another lot renders fresh (cheap, and
+    # only happens when the user actively picks a different lot).
+    if preview_bytes and lot_idx == 0:
         st.image(preview_bytes, use_container_width=True)
     else:
         fig = render_wafermaps(cp1_wafers, result.config, titles=titles)
@@ -394,12 +410,13 @@ def _render_result(result: GenerationResult, sig_name: str, key_prefix: str,
                 "S2S factors per site: "
                 + ", ".join(f"site {i + 1}: {f:.2f}" for i, f in enumerate(result.s2s))
             )
-        if len(result.lots) > 1:
+        if n_lots > 1:
             lots_df = pd.DataFrame([
-                {"Lot": l.lot_id,
+                {"Previewed above": "→" if i == lot_idx else "",
+                 "Lot": l.lot_id,
                  "Sort start": l.start_time.strftime("%Y-%m-%d %H:%M"),
                  "Wafers": len(l.wafers)}
-                for l in result.lots
+                for i, l in enumerate(result.lots)
             ])
             st.dataframe(lots_df, use_container_width=True, hide_index=True)
 

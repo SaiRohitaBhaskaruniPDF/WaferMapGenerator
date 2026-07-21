@@ -94,7 +94,7 @@ breakdown. Summary:
 ## Setup
 
 ```powershell
-cd SpacialSignatures
+cd SpatialSignatures
 py -m pip install -r requirements.txt
 copy .env.example .env
 ```

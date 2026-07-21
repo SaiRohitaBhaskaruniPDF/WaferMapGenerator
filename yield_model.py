@@ -92,16 +92,35 @@ def resolve_target_yield(config: WaferConfig, yield_mode: str,
 # CP1: converge the signature wafer on the target yield
 # ---------------------------------------------------------------------------
 
+# When a defect-density / direct yield target implies MORE yield than the
+# raw spatial signature gives, apply_yield_target() has to revive some of the
+# signature's failed dies. Left alone, it can only revive dies that the
+# signature already failed — which, for a LOCALIZED signature like Edge Ring
+# or Center Cluster, means 100% of the fails stay confined to that one region
+# and everywhere else on the wafer is mathematically perfect. Real wafers
+# always have a little background defectivity scattered outside the dominant
+# signature, so we relocate this fraction of the fails that WOULD remain
+# after revival to random positions anywhere on the wafer instead. Total fail
+# count (and therefore the requested yield) is unchanged — only where those
+# fails sit changes.
+BACKGROUND_RELOCATE_FRACTION = 0.15
+
+
 def apply_yield_target(die_results: List[DieResult],
                        target_yield: Optional[float],
                        seed: Optional[int] = None) -> List[DieResult]:
     """Adjust a signature-binned wafer so its yield converges on the target.
 
-    The spatial signature stays visually intact:
+    The spatial signature stays visually dominant, but not artificially pure:
       * If the wafer yields MORE than the target, extra random dies are killed
         with RANDOM_FAIL (bin 5) — like background defectivity on a real wafer.
       * If the wafer yields LESS than the target, a random subset of failed
-        dies is revived (pass). This thins the signature instead of erasing it.
+        dies is revived (pass). This thins the signature instead of erasing
+        it. A small share of the fails that remain after thinning are also
+        RELOCATED to random dies anywhere on the wafer (not just inside the
+        signature's footprint), so a localized pattern like Edge Ring still
+        shows a touch of realistic background fallout elsewhere instead of a
+        perfectly clean, 100%-yield region outside the pattern.
 
     target_yield is a 0..1 fraction; None means "leave the wafer alone".
     """
@@ -125,9 +144,25 @@ def apply_yield_target(die_results: List[DieResult],
     elif len(pass_idx) < target_pass:
         # Too sick: revive random failed dies until we hit the target.
         n_revives = min(target_pass - len(pass_idx), len(fail_idx))
-        for i in rng.sample(fail_idx, n_revives):
+
+        # Of the fails that will remain after revival, relocate a small
+        # fraction from the signature's footprint to random dies elsewhere.
+        n_remaining = len(fail_idx) - n_revives
+        n_relocate = min(
+            n_remaining,
+            round(n_remaining * BACKGROUND_RELOCATE_FRACTION),
+            len(pass_idx),
+        )
+
+        revive_pool = rng.sample(fail_idx, n_revives + n_relocate)
+        for i in revive_pool:
             d = results[i]
             results[i] = (d[0], d[1], d[2], d[3], PASS_BIN)
+
+        if n_relocate:
+            for i in rng.sample(pass_idx, n_relocate):
+                d = results[i]
+                results[i] = (d[0], d[1], d[2], d[3], RANDOM_FAIL_BIN)
     return results
 
 

@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+pytest-cache-files-*
+tests
+.env
+.streamlit/secrets.toml
+*.docx
+*.xlsx
+.cursor
+README.md
+Spec_Implementation_Audit.md
